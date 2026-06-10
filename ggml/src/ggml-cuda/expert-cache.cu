@@ -180,7 +180,12 @@ struct ec3_global {
     int32_t      cur_slot_idx[64] = {};
     int          cur_n_ids = 0;
     std::unordered_map<const void *, int> glu_learn;  // gate MMID dst base -> blk
-    bool         defer    = true; // LLAMA_EC3_DEFER=0 to disable gate-defer
+    bool         defer    = false; // LLAMA_EC3_DEFER=1 to enable gate-defer.
+                                   // OFF by default: measured perf-neutral, and the
+                                   // adjacency-learned safety proof does not cover
+                                   // models with readers between the MMIDs
+                                   // (gpt-oss bias add_id, per-expert scales) —
+                                   // see EC3_READINESS.md B2.
     bool         reuse    = true; // LLAMA_EC3_REUSE=0 to disable act-quant reuse
     bool         stripe   = false; // LLAMA_EC3_STRIPE=1: role-stripe devices (forces defer off)
 
@@ -194,7 +199,11 @@ struct ec3_global {
     // the CPU GLU hook was OBSERVED matching that layer's gate/up dst pair
     // (learned on the first decode tokens) — a graph without the hook firing
     // would otherwise compute silu(garbage)*garbage for the skipped rows.
-    bool fuse = true;                    // LLAMA_EC3_FUSE=0 to disable
+    bool fuse = false;                   // LLAMA_EC3_FUSE=1 to enable.
+                                         // OFF by default: measured perf-neutral, and
+                                         // fused pending entries lack epoch scoping
+                                         // (stale-entry hazard during warmup) —
+                                         // see EC3_READINESS.md B1.
     long long fuse_serial = 0;
     bool safe_fuse_blk[1024] = {};
     const void * role_base[2][1024] = {}; // [role][blk] -> tensor host base
@@ -361,14 +370,15 @@ static void ec3_start_workers() {
 // simply gets its pool late. No visit order can lock a device out.
 struct ec3_discovery {
     std::unordered_set<uint64_t> seen;
-    struct shape { size_t size; int wtype; int n_tensors; int roles; };
+    struct shape { size_t size; int wtype; int n_tensors; int roles; int64_t n_expert; };
     std::vector<shape> pending[EC3_MAX_DEV];   // shapes seen, pool not yet built
     bool any_repeat = false;
 };
 static ec3_discovery g_disc;
 
 // build one pool for (size, wtype) on device di; caller ensures no duplicate
-static bool ec3_pool_alloc(int di, size_t expert_size, int wtype, size_t budget, bool paired) {
+static bool ec3_pool_alloc(int di, size_t expert_size, int wtype, size_t budget, bool paired,
+                           int64_t max_entries) {
     ec3_device & d = g.dev[di];
     if (d.n_pools >= EC3_MAX_POOLS) return false;
 
@@ -379,9 +389,24 @@ static bool ec3_pool_alloc(int di, size_t expert_size, int wtype, size_t budget,
     // cached EXPERTS per byte as two independent entries — but joint by
     // construction, which the fused kernel requires
     int ns = (int)(budget / (paired ? 2 * expert_size : expert_size));
+    // NOTE: do NOT cap ns by the discovered tensor census — the census can be
+    // incomplete at allocation time (visit-order dependent) and a wrong cap
+    // permanently starves the pool (measured: 256-slot down pool, -31% t/s).
+    // Slot over-allocation (M4 in EC3_READINESS.md) needs a stable census first.
+    GGML_UNUSED(max_entries);
     if (ns < 64) {
-        EC3_LOG("[ec3] dev=%d pool for %zu KB slots skipped (budget %zu MB too small)\n",
-                di, expert_size >> 10, budget >> 20);
+        static int warned = 0;
+        if (warned++ < 2) {
+            EC3_LOG("[ec3] dev=%d pool for %zu KB slots skipped (budget %zu MB too small) — cache stays off for this shape\n",
+                    di, expert_size >> 10, budget >> 20);
+        }
+        // dead marker: prevents endless re-discovery + re-trigger + log spam
+        ec3_pool & p = d.pools[d.n_pools];
+        p.expert_size = expert_size;
+        p.wtype       = wtype;
+        p.slab        = nullptr;
+        p.n_slots     = 0;
+        d.n_pools++;
         return false;
     }
 
@@ -436,6 +461,21 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
     if (!g.enabled || n_tokens < 1 || n_tokens > g.max_batch) return -1;
     if (expert_size < g.min_expert_bytes) return -1;
 
+    // only types with a kernel case in mul_mat_vec_q_switch_type — anything else
+    // would GGML_ABORT on the first cached row (e.g. F16/BF16/TQ expert tensors)
+    switch ((ggml_type)wtype) {
+        case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1: case GGML_TYPE_Q8_0: case GGML_TYPE_MXFP4:
+        case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S:  case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:   case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS:
+            break;
+        default:
+            return -1;
+    }
+
     const char * p = strstr(name, "blk.");
     if (!p || !strstr(name, "_exps")) return -1;
     const int blk = atoi(p + 4);
@@ -465,7 +505,7 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
             if (sh.size == expert_size && sh.wtype == wtype) { shp = &sh; break; }
         }
         if (!shp) {
-            g_disc.pending[di].push_back({expert_size, wtype, 0, 0});
+            g_disc.pending[di].push_back({expert_size, wtype, 0, 0, n_expert});
             shp = &g_disc.pending[di].back();
             EC3_DBG("[ec3-dbg] new shape %s blk=%d dev=%d size=%zu type=%d\n",
                     name, blk, di, expert_size, wtype);
@@ -504,7 +544,13 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
             for (auto & sh : pend) {
                 const double w = (double)sh.size * (sh.n_tensors > 0 ? sh.n_tensors : 1);
                 const bool paired = g.fuse && (sh.roles & 0b11) == 0b11;
-                ec3_pool_alloc(di, sh.size, sh.wtype, (size_t)(avail * (w / total_w)), paired);
+                // census may be incomplete on this device (visit-order dependent):
+                // cap any single pool so a later-discovered shape always fits
+                size_t budget = (size_t)(avail * (w / total_w));
+                const size_t cap = (size_t)(avail * 0.60);
+                if (budget > cap) budget = cap;
+                const int64_t max_entries = (paired ? sh.n_tensors / 2 : sh.n_tensors) * sh.n_expert;
+                ec3_pool_alloc(di, sh.size, sh.wtype, budget, paired, max_entries);
             }
         }
         pend.clear();
@@ -513,6 +559,7 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
         }
         if (pi < 0) return -1;
     }
+    if (d.pools[pi].slab == nullptr) return -1;   // dead marker (alloc failed)
     if (!g_disc.any_repeat) {
         if (g_disc.seen.count(kb)) {
             g_disc.any_repeat = true;

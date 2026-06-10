@@ -75,6 +75,11 @@ struct ggml_expert_cache_v3_api {
     // pending fused work for this (src0, src1) pair.
     unsigned long long (*glu_hits)(const void * src0_data, const void * src1_data,
                                    void * dst_data, size_t dst_nb1, int ith);
+
+    // Host weight buffer teardown notification (model unload): drops queued
+    // insert jobs sourced from the range and resets per-block tensor-base
+    // learning. Must be called before the memory is unmapped/freed.
+    void (*invalidate)(const void * base, size_t size);
 };
 
 // Zero-initialized in ggml-backend.cpp; populated by the CUDA backend in

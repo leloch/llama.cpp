@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -165,7 +166,10 @@ struct ec3_global {
     // insert queue + workers
     std::mutex              mu;  // guards pools/queue of all devices
     std::condition_variable cv;
+    std::condition_variable cv_idle;          // signaled when a worker finishes a job
     std::deque<ec3_job>     queue;
+    const void *            inflight_src[16] = {};   // per-worker current source
+    size_t                  inflight_len[16] = {};
     bool                    workers_started = false;
 
     // current node context (begin..collect happen on one thread)
@@ -250,6 +254,13 @@ static uint64_t ec3_fnv1a(const char * s) {
     return h;
 }
 
+static inline uint64_t ec3_ptr_hash(const void * p) {
+    uint64_t v = (uint64_t)(uintptr_t)p;
+    v *= 0xFF51AFD7ED558CCDULL;
+    v ^= v >> 33;
+    return v;
+}
+
 static inline uint64_t ec3_key(uint64_t name_hash, int eid) {
     return name_hash ^ ((uint64_t)(uint32_t)eid * 0x9E3779B97F4A7C15ULL);
 }
@@ -273,7 +284,7 @@ static void ec3_lru_push_back(ec3_pool & p, int idx) {
 
 // ---- insert workers ----------------------------------------------------------
 
-static void ec3_worker_main() {
+static void ec3_worker_main(int wid) {
     // per-worker pinned staging buffer + per-device copy streams: the host
     // memcpy runs at RAM speed on this thread, the H2D is a true async DMA on
     // a dedicated stream — no pageable-copy driver contention with the
@@ -289,6 +300,8 @@ static void ec3_worker_main() {
             g.cv.wait(lk, []{ return !g.queue.empty(); });
             job = g.queue.front();
             g.queue.pop_front();
+            g.inflight_src[wid] = job.src;
+            g.inflight_len[wid] = job.bytes;
         }
 
         ec3_pool & p = g.dev[job.dev].pools[job.pool];
@@ -330,6 +343,9 @@ static void ec3_worker_main() {
 
         {
             std::lock_guard<std::mutex> lk(g.mu);
+            g.inflight_src[wid] = nullptr;
+            g.inflight_len[wid] = 0;
+            g.cv_idle.notify_all();
             ec3_slot & s = p.slots[job.slot_idx];
             if (s.queued && s.key == job.key) {
                 s.queued = false;
@@ -354,8 +370,8 @@ static void ec3_worker_main() {
 static void ec3_start_workers() {
     if (g.workers_started) return;
     g.workers_started = true;
-    for (int i = 0; i < g.n_workers; i++) {
-        std::thread(ec3_worker_main).detach();
+    for (int i = 0; i < g.n_workers && i < 16; i++) {
+        std::thread(ec3_worker_main, i).detach();
     }
 }
 
@@ -462,6 +478,31 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
 
     if (!g.enabled || n_tokens < 1 || n_tokens > g.max_batch) return -1;
     if (expert_size < g.min_expert_bytes) return -1;
+
+    // single-owner engagement: begin..collect carries per-node state in g.cur_*;
+    // a second thread (concurrent llama_context) gets a clean refusal instead
+    // of corrupted planning state
+    {
+        const uint64_t self = (uint64_t)(uintptr_t)&self;   // stack addr as cheap thread tag
+        GGML_UNUSED(self);
+        static std::atomic<int64_t> owner{-1};
+        // note: ggml threadpools reuse thread 0 across graphs; identify by
+        // thread id, claimed lazily and never released (single decode thread
+        // is the rule; a true second decoder simply never engages)
+        static thread_local bool is_owner_thread = false;
+        if (!is_owner_thread) {
+            int64_t expect = -1;
+            static std::atomic<int64_t> next_id{1};
+            static thread_local int64_t my_id = next_id.fetch_add(1);
+            if (owner.compare_exchange_strong(expect, my_id)) {
+                is_owner_thread = true;
+            } else if (owner.load() == my_id) {
+                is_owner_thread = true;
+            } else {
+                return -1;
+            }
+        }
+    }
 
     // only types with a kernel case in mul_mat_vec_q_switch_type — anything else
     // would GGML_ABORT on the first cached row (e.g. F16/BF16/TQ expert tensors)
@@ -603,12 +644,16 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
 
     EC3_DBG("[ec3-dbg] begin %s dev=%d pool=%d role=%d\n", name, di, pi, role);
 
-    // paired pools share ONE entry per (blk, expert): key by blk, not by name
+    // paired pools share ONE entry per (blk, expert): key by blk + the GATE
+    // tensor's host base (two models in one process must never alias — names
+    // and blk indices collide across models, data pointers do not)
     if (d.pools[pi].paired && (role == 0 || role == 1)) {
-        g.cur_key_base = 0xEC3000000000000ULL ^ ((uint64_t)blk << 32);
         if (blk >= 0 && blk < 1024) g.role_base[role][blk] = host_base;
+        const void * anchor = (blk >= 0 && blk < 1024 && g.role_base[0][blk])
+                              ? g.role_base[0][blk] : host_base;
+        g.cur_key_base = 0xEC3000000000000ULL ^ ((uint64_t)blk << 32) ^ ec3_ptr_hash(anchor);
     } else {
-        g.cur_key_base = kb;
+        g.cur_key_base = kb ^ ec3_ptr_hash(host_base);
     }
     g.cur_host_base   = host_base;
     g.cur_expert_size = expert_size;
@@ -1237,6 +1282,45 @@ static unsigned long long ec3_glu_hits(const void * src0_data, const void * src1
     }
 }
 
+// ---- API: invalidate (host weight buffer teardown) -------------------------------------
+//
+// Called when a host buffer is freed (model unload). Queued insert jobs whose
+// source lies in the range are dropped; a worker mid-copy from the range is
+// waited out; per-blk tensor-base learning that points into the range is reset.
+// Cached slots become unreachable automatically (keys mix the host base) and
+// are reclaimed by LRU.
+
+static void ec3_invalidate(const void * base, size_t size) {
+    if (!g.enabled) return;
+    const char * lo = (const char *)base;
+    const char * hi = lo + size;
+    auto in_range = [&](const void * p) {
+        return p && (const char *)p >= lo && (const char *)p < hi;
+    };
+
+    std::unique_lock<std::mutex> lk(g.mu);
+    for (auto it = g.queue.begin(); it != g.queue.end(); ) {
+        if (in_range(it->src) || in_range(it->src_gate)) {
+            // orphan the slot bookkeeping (entry stays queued=true and is
+            // skipped by eviction until overwritten; safe and rare)
+            it = g.queue.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    g.cv_idle.wait(lk, [&]{
+        for (int w = 0; w < 16; w++) {
+            const char * s = (const char *)g.inflight_src[w];
+            if (s && s + g.inflight_len[w] > lo && s < hi) return false;
+        }
+        return true;
+    });
+    for (int b = 0; b < 1024; b++) {
+        if (in_range(g.role_base[0][b])) g.role_base[0][b] = nullptr;
+        if (in_range(g.role_base[1][b])) g.role_base[1][b] = nullptr;
+    }
+}
+
 // ---- API: stats ----------------------------------------------------------------------
 
 static void ec3_stats(void) {
@@ -1431,6 +1515,7 @@ void ggml_expert_cache_v3_register(void) {
     ggml_expert_cache_v3.redirect_offer    = ec3_redirect_offer;
     ggml_expert_cache_v3.redirect_finalize = ec3_redirect_finalize;
     ggml_expert_cache_v3.glu_hits          = ec3_glu_hits;
+    ggml_expert_cache_v3.invalidate        = ec3_invalidate;
     if (const char * e = getenv("LLAMA_EC3_REDIRECT")) g.redirect_on = atoi(e) > 0;
 
     EC3_LOG("[ec3] enabled: n_dev=%d budget=%s inserts/plan=%d workers=%d stats_every=%d\n",

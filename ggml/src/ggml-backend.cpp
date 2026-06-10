@@ -114,6 +114,15 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
         return;
     }
 
+    // expert-cache v3: host weight buffers can back queued cache-fill jobs;
+    // notify before the memory goes away (no-op when the cache is inactive)
+    if (ggml_expert_cache_v3.invalidate && buffer->iface.get_base && ggml_backend_buffer_is_host(buffer)) {
+        void * base = ggml_backend_buffer_get_base(buffer);
+        if (base) {
+            ggml_expert_cache_v3.invalidate(base, ggml_backend_buffer_get_size(buffer));
+        }
+    }
+
     if (buffer->iface.free_buffer != NULL) {
         buffer->iface.free_buffer(buffer);
     }

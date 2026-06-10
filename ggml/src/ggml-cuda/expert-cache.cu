@@ -95,7 +95,7 @@ struct ec3_global {
     size_t budget_mb = 0;        // 0 = auto (fraction of free VRAM at init)
     int    inserts_per_plan = 8; // max inserts enqueued per plan() call
     int    queue_max        = 512;
-    int    n_workers        = 2;
+    int    n_workers        = 4;
     int    stats_every      = 0; // log every N collect() calls (0 = off)
 
     ec3_device dev[EC3_MAX_DEV];
@@ -162,6 +162,14 @@ static void ec3_lru_push_back(ec3_pool & p, int idx) {
 // ---- insert workers ----------------------------------------------------------
 
 static void ec3_worker_main() {
+    // per-worker pinned staging buffer + per-device copy streams: the host
+    // memcpy runs at RAM speed on this thread, the H2D is a true async DMA on
+    // a dedicated stream — no pageable-copy driver contention with the
+    // dispatch path's kernel launches.
+    char * stage = nullptr;
+    size_t stage_cap = 0;
+    cudaStream_t cstream[EC3_MAX_DEV] = {};
+
     for (;;) {
         ec3_job job;
         {
@@ -175,10 +183,27 @@ static void ec3_worker_main() {
         cudaSetDevice(job.dev);
         EC3_DBG("[ec3-dbg] worker job dev=%d slot=%d bytes=%zu\n", job.dev, job.slot_idx, job.bytes);
         char * dst = p.slab + (size_t)job.slot_idx * p.expert_size;
-        // synchronous copy from pageable (mmap'd) memory; this thread exists to
-        // absorb exactly this latency. Non-blocking streams elsewhere are not
-        // serialized by legacy-default-stream semantics.
-        cudaError_t err = cudaMemcpy(dst, job.src, job.bytes, cudaMemcpyHostToDevice);
+
+        cudaError_t err = cudaSuccess;
+        if (stage_cap < job.bytes) {
+            if (stage) cudaFreeHost(stage);
+            err = cudaMallocHost((void **)&stage, job.bytes * 2);
+            stage_cap = (err == cudaSuccess) ? job.bytes * 2 : 0;
+            if (err != cudaSuccess) stage = nullptr;
+        }
+        if (!cstream[job.dev]) {
+            cudaStreamCreateWithFlags(&cstream[job.dev], cudaStreamNonBlocking);
+        }
+        if (err == cudaSuccess && stage && cstream[job.dev]) {
+            memcpy(stage, job.src, job.bytes);
+            err = cudaMemcpyAsync(dst, stage, job.bytes, cudaMemcpyHostToDevice, cstream[job.dev]);
+            if (err == cudaSuccess) {
+                err = cudaStreamSynchronize(cstream[job.dev]);
+            }
+        } else if (err == cudaSuccess) {
+            // pinned alloc failed: fall back to a direct pageable copy
+            err = cudaMemcpy(dst, job.src, job.bytes, cudaMemcpyHostToDevice);
+        }
 
         {
             std::lock_guard<std::mutex> lk(g.mu);
@@ -296,10 +321,17 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
         for (auto & sh : g_warm.shapes[di]) {
             if (sh.size == expert_size && sh.wtype == wtype) { known = true; break; }
         }
-        if (!known) g_warm.shapes[di].push_back({expert_size, wtype});
+        if (!known) {
+            g_warm.shapes[di].push_back({expert_size, wtype});
+            EC3_DBG("[ec3-dbg] warm new shape %s blk=%d dev=%d size=%zu type=%d\n",
+                    name, blk, di, expert_size, wtype);
+        }
 
         if (g_warm.seen.count(kb)) {
             g_warm.done = true;
+            EC3_LOG("[ec3] warmup done (trigger=%s); shapes/dev:", name);
+            for (int i = 0; i < g.n_dev; i++) EC3_LOG(" %zu", g_warm.shapes[i].size());
+            EC3_LOG("\n");
             for (int i = 0; i < g.n_dev; i++) ec3_dev_alloc(i);
         } else {
             g_warm.seen.insert(kb);
@@ -363,6 +395,14 @@ static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) 
 
         // ---- enqueue async insert (budgeted) ----
         if (inserts_left <= 0 || (int)g.queue.size() >= g.queue_max) {
+            d.insert_skips++;
+            continue;
+        }
+        // admission throttle at capacity: when the pool is full, churn (evict +
+        // re-copy on every miss) steals host RAM bandwidth from the CPU matmuls.
+        // Admit only a fraction of misses so the content still adapts but the
+        // copy traffic stays bounded.
+        if (p.n_used >= p.n_slots && (d.misses & 7) != 0) {
             d.insert_skips++;
             continue;
         }

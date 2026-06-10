@@ -199,11 +199,10 @@ struct ec3_global {
     // the CPU GLU hook was OBSERVED matching that layer's gate/up dst pair
     // (learned on the first decode tokens) — a graph without the hook firing
     // would otherwise compute silu(garbage)*garbage for the skipped rows.
-    bool fuse = false;                   // LLAMA_EC3_FUSE=1 to enable.
-                                         // OFF by default: measured perf-neutral, and
-                                         // fused pending entries lack epoch scoping
-                                         // (stale-entry hazard during warmup) —
-                                         // see EC3_READINESS.md B1.
+    bool fuse = true;                    // LLAMA_EC3_FUSE=0 to disable. Stale-entry
+                                         // hazard (EC3_READINESS.md B1) closed by
+                                         // gate-begin epoch invalidation + up-node
+                                         // mask reuse.
     long long fuse_serial = 0;
     bool safe_fuse_blk[1024] = {};
     const void * role_base[2][1024] = {}; // [role][blk] -> tensor host base
@@ -373,6 +372,11 @@ struct ec3_discovery {
     struct shape { size_t size; int wtype; int n_tensors; int roles; int64_t n_expert; };
     std::vector<shape> pending[EC3_MAX_DEV];   // shapes seen, pool not yet built
     bool any_repeat = false;
+    // stable-census guard: pools are built only after the shape census has not
+    // changed for a window of eligible visits AND a tensor has repeated. A
+    // partially-discovered census mis-sizes pools permanently (measured: the
+    // 754B server lost its down pools to visit-order luck).
+    int  stable_count = 0;
 };
 static ec3_discovery g_disc;
 
@@ -389,11 +393,9 @@ static bool ec3_pool_alloc(int di, size_t expert_size, int wtype, size_t budget,
     // cached EXPERTS per byte as two independent entries — but joint by
     // construction, which the fused kernel requires
     int ns = (int)(budget / (paired ? 2 * expert_size : expert_size));
-    // NOTE: do NOT cap ns by the discovered tensor census — the census can be
-    // incomplete at allocation time (visit-order dependent) and a wrong cap
-    // permanently starves the pool (measured: 256-slot down pool, -31% t/s).
-    // Slot over-allocation (M4 in EC3_READINESS.md) needs a stable census first.
-    GGML_UNUSED(max_entries);
+    // cap slots at the number of distinct cacheable entries (safe now: pools
+    // are only built after the stable-census window, so n_tensors is real)
+    if (max_entries > 0 && ns > max_entries) ns = (int)max_entries;
     if (ns < 64) {
         static int warned = 0;
         if (warned++ < 2) {
@@ -507,19 +509,30 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
         if (!shp) {
             g_disc.pending[di].push_back({expert_size, wtype, 0, 0, n_expert});
             shp = &g_disc.pending[di].back();
+            g_disc.stable_count = 0;   // census changed: restart the stability window
             EC3_DBG("[ec3-dbg] new shape %s blk=%d dev=%d size=%zu type=%d\n",
                     name, blk, di, expert_size, wtype);
+        } else {
+            g_disc.stable_count++;
         }
         if (first_sight) shp->n_tensors++;   // distinct tensors using this shape
         if (role >= 0) shp->roles |= 1 << role;
         if (!g_disc.any_repeat) {
             if (g_disc.seen.count(kb)) {
                 g_disc.any_repeat = true;
-                EC3_LOG("[ec3] decode loop detected (trigger=%s) — building pools on demand\n", name);
             } else {
                 g_disc.seen.insert(kb);
                 return -1;
             }
+        }
+        // stable-census window: 64 eligible visits without a new shape
+        if (g_disc.stable_count < 64) {
+            return -1;
+        }
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            EC3_LOG("[ec3] decode loop detected, shape census stable — building pools\n");
         }
         // steady state reached: build this device's pending pools in ONE
         // proportional pass. Budgets are weighted by referenced bytes per
@@ -567,6 +580,14 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
             g_disc.seen.insert(kb);
             return -1;
         }
+    }
+
+    // fused-state epoch: every gate node on a device invalidates any leftover
+    // fused entry (zero-hit gate nodes never reach collect, and gallocr reuses
+    // dst pointers across layers — a stale entry must never survive into the
+    // next layer's GLU; see EC3_READINESS.md B1)
+    if (role == 0) {
+        g.dev[di].fused.active = false;
     }
 
     // gate-defer safety learning: mark a layer safe when its up node is the
@@ -634,6 +655,27 @@ static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) 
     ec3_pool   & p = d.pools[g.cur_pool];
 
     const int64_t t0 = ggml_time_us();
+
+    // fused up node: reuse the gate node's recorded hit mask verbatim. The
+    // rows are computed already (fused dispatch at the gate node); a fresh
+    // lookup could diverge (eviction between the plans) and skip a row that
+    // nobody computed.
+    if (g.cur_n_tokens == 1 && p.paired && g.cur_role == 1 &&
+        g.cur_blk >= 0 && g.cur_blk < 1024 && g.safe_fuse_blk[g.cur_blk] &&
+        d.fused.active && d.fused.gate_dst != nullptr) {
+        int nh = 0;
+        for (int k = 0; k < n_ids && k < 64; k++) {
+            const bool hit = (d.fused.mask >> k) & 1ull;
+            slot_idx[k] = hit ? 0 : -1;   // value unused (no dispatch); sign is the skip signal
+            if (hit) nh++;
+        }
+        g.cur_n_ids = n_ids;
+        for (int k = 0; k < n_ids && k < 64; k++) g.cur_slot_idx[k] = slot_idx[k];
+        d.t_plan_us += ggml_time_us() - t0;
+        d.n_nodes++;
+        return nh;
+    }
+
     int n_hits = 0;
     int inserts_left = g.inserts_per_plan;
 

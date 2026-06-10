@@ -1551,6 +1551,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    // expert-cache v3 diagnostics: one-shot dump of the split schedule
+    static int ec3_splitdump = -1;
+    if (ec3_splitdump < 0) {
+        const char * e = getenv("LLAMA_EC3_SPLITDUMP");
+        ec3_splitdump = e ? atoi(e) : 0;
+    }
+    if (ec3_splitdump > 0) {
+        ec3_splitdump--;
+        for (int i = 0; i < sched->n_splits; i++) {
+            struct ggml_backend_sched_split * sp = &splits[i];
+            fprintf(stderr, "[split %3d] %-8s n_nodes=%-3d n_inputs=%-2d first='%s' last='%s'\n",
+                    i, ggml_backend_name(sched->backends[sp->backend_id]),
+                    sp->graph.n_nodes, sp->n_inputs,
+                    sp->graph.n_nodes > 0 ? sp->graph.nodes[0]->name : "-",
+                    sp->graph.n_nodes > 0 ? sp->graph.nodes[sp->graph.n_nodes-1]->name : "-");
+        }
+    }
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;

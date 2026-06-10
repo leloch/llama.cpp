@@ -54,6 +54,8 @@
 #    include "spacemit/ime.h"
 #endif
 
+#include "../ggml-backend-expert-cache.h"
+
 // Note: once we move threading into a separate C++ file
 // will use std::hardware_destructive_interference_size instead of hardcoding it here
 // and we'll use C++ attribute syntax.
@@ -1556,6 +1558,15 @@ static void ggml_compute_forward_mul_mat_id(
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
 
+    // expert-cache v3 state (set on thread 0 only; other threads keep dev = -1)
+    enum { EC3_MAX_TOPK = 64 };
+    int           ec3_dev = -1;
+    int           ec3_n_hits = 0;
+    int32_t       ec3_slot_idx[EC3_MAX_TOPK];   // per-k slot index, -1 = miss
+    int32_t       ec3_compact[EC3_MAX_TOPK];    // slot indices of hits, in order
+    const float * ec3_acts[EC3_MAX_TOPK];       // activation row per hit
+    float *       ec3_rows[EC3_MAX_TOPK];       // dst row per hit
+
     void * wdata_cur = params->wdata;
 
     if (src1->type != vec_dot_type) {
@@ -1611,6 +1622,24 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0) {
+        // expert-cache v3: for single-token decode, rows whose expert weights are
+        // resident in the VRAM cache are dispatched to the GPU here and excluded
+        // from the CPU row mapping. The GPU computes them while the threadpool
+        // computes the remaining rows; results land in dst in the collect step
+        // at the end of this function, before the node completes.
+        if (ggml_expert_cache_v3.begin && src1->type == GGML_TYPE_F32 &&
+            ids->ne[1] == 1 && n_ids <= EC3_MAX_TOPK) {
+            ec3_dev = ggml_expert_cache_v3.begin(src0->name, src0->data, nb02,
+                                                 ne00, ne01, (int) type, ne02, ids->ne[1]);
+            if (ec3_dev >= 0) {
+                int32_t ec3_ids[EC3_MAX_TOPK];
+                for (int id = 0; id < n_ids; ++id) {
+                    ec3_ids[id] = *(const int32_t *) ((const char *) ids->data + id*ids->nb[0]);
+                }
+                ggml_expert_cache_v3.plan(ec3_dev, ec3_ids, n_ids, ec3_slot_idx);
+            }
+        }
+
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
@@ -1619,11 +1648,35 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 >= 0 && i02 < n_as);
+                if (i02 < 0) {
+                    // sentinel id: zero the dst row so it contributes nothing
+                    float * dst_row = (float *)((char *) dst->data + iid1*nb2 + id*nb1);
+                    memset(dst_row, 0, ne0*sizeof(float));
+                    continue;
+                }
+
+                assert(i02 < n_as);
+
+                if (ec3_dev >= 0 && ec3_slot_idx[id] >= 0) {
+                    // GPU computes this row from the expert cache
+                    const int64_t i11 = id % ne11;
+                    ec3_compact[ec3_n_hits] = ec3_slot_idx[id];
+                    ec3_acts[ec3_n_hits]    = (const float *) ((const char *) src1->data + i11*nb11 + iid1*nb12);
+                    ec3_rows[ec3_n_hits]    = (float *) ((char *) dst->data + iid1*nb2 + id*nb1);
+                    ec3_n_hits++;
+                    continue;
+                }
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
             }
+        }
+
+        if (ec3_dev >= 0 && ec3_n_hits > 0) {
+            // one batched GPU launch for all cached rows; overlaps with the
+            // CPU miss-row compute below, collected before the node ends
+            ggml_expert_cache_v3.dispatch(ec3_dev, (int) type, ne00, ne01,
+                                          ec3_n_hits, ec3_compact, ec3_acts);
         }
     }
 
@@ -1694,6 +1747,13 @@ static void ggml_compute_forward_mul_mat_id(
 
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
         }
+    }
+
+    // expert-cache v3: thread 0 collects the GPU-computed rows into dst. The
+    // graph executor's post-node barrier guarantees every thread (including
+    // this one) is done before the next node reads dst.
+    if (ec3_dev >= 0 && ec3_n_hits > 0) {
+        ggml_expert_cache_v3.collect(ec3_dev, ec3_n_hits, ec3_rows, ne0);
     }
 }
 

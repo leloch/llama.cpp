@@ -12,6 +12,11 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-backend-expert-cache.h"
+
+// expert cache v3 function table; populated by the CUDA backend at registry
+// init when LLAMA_EC3=1, consumed by the CPU mul_mat_id kernel.
+struct ggml_expert_cache_v3_api ggml_expert_cache_v3 = {};
 
 #include <assert.h>
 #include <limits.h>

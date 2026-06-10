@@ -1726,6 +1726,42 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // expert-cache v3 dst handoff: before running a CPU split that ends in a
+        // MUL_MAT_ID, offer the cache the GPU-side copy tensor of that dst so it
+        // can scatter its GPU-computed rows directly (skipping the host round
+        // trip). Engaged only with a single, unique CUDA consumer and one copy.
+        // note: the CPU backend is always the last one (asserted in sched_new);
+        // do NOT use ggml_backend_dev_type here — the CUDA implementation calls
+        // cudaGetDeviceProperties (~ms per call!) and this runs per split.
+        if (ggml_expert_cache_v3.redirect_offer && sched->n_copies == 1 &&
+            split->graph.n_nodes > 0 &&
+            split_backend_id == sched->n_backends - 1) {
+            ggml_tensor * last = split->graph.nodes[split->graph.n_nodes - 1];
+            if (last->op == GGML_OP_MUL_MAT_ID && !(last->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                int consumer_split = -1;
+                int n_consumers = 0;
+                for (int j = split_id + 1; j < sched->n_splits && n_consumers < 2; j++) {
+                    for (int k = 0; k < splits[j].n_inputs; k++) {
+                        if (splits[j].inputs[k] == last) {
+                            n_consumers++;
+                            consumer_split = j;
+                            break;
+                        }
+                    }
+                }
+                if (n_consumers == 1) {
+                    ggml_backend_t cons_backend = sched->backends[splits[consumer_split].backend_id];
+                    ggml_tensor * cpy = tensor_copy(last, splits[consumer_split].backend_id, sched->cur_copy);
+                    if (cpy && cpy->data && splits[consumer_split].backend_id != sched->n_backends - 1 &&
+                        ggml_is_contiguous(last)) {
+                        ggml_expert_cache_v3.redirect_offer(last->data, last->nb[1],
+                                                            last->ne[1] * last->ne[2],
+                                                            cpy->data, cons_backend);
+                    }
+                }
+            }
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {

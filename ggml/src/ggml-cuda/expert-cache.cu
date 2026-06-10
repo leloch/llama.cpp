@@ -119,6 +119,10 @@ struct ec3_device {
     } fused;
     long long fused_layers = 0;
 
+    // striping-probe: how much chain latency STICKS OUT past the CPU work
+    long long glusync_us = 0, glusync_n = 0;     // fused-chain wait at the GLU node
+    long long evt_ready = 0, evt_wait_us = 0, evt_wait_n = 0;  // down chain at finalize
+
 
     // stats
     long long hits = 0, misses = 0, inserts = 0, evictions = 0;
@@ -1427,6 +1431,15 @@ static int ec3_redirect_finalize(const void * host_dst_data, void * consumer_bac
     ggml_backend_t be = (ggml_backend_t)consumer_backend;
     ggml_backend_cuda_context * cc = (ggml_backend_cuda_context *)be->context;
     ggml_cuda_set_device(cc->device);
+    if (cudaEventQuery(d.redir_evt[re.par]) == cudaSuccess) {
+        d.evt_ready++;
+    } else {
+        cudaGetLastError();
+        const int64_t ew0 = ggml_time_us();
+        cudaEventSynchronize(d.redir_evt[re.par]);   // probe: residual chain latency at point-of-need
+        d.evt_wait_us += ggml_time_us() - ew0;
+        d.evt_wait_n++;
+    }
     if (!ec3_ok(re.dev, cudaStreamWaitEvent(cc->stream(), d.redir_evt[re.par], 0), "redirect wait") ||
         !ec3_ok(re.dev, cudaMemcpyAsync(re.gpu_ptr, img, (size_t)re.n_rows * re.nb1,
                                cudaMemcpyHostToDevice, cc->stream()), "redirect H2D")) {
@@ -1471,8 +1484,11 @@ static unsigned long long ec3_glu_hits(const void * src0_data, const void * src1
         if (ith == 0 && !f.scattered) {
             ec3_device & d = g.dev[di];
             ggml_cuda_set_device(di);
+            const int64_t gs0 = ggml_time_us();
             const bool gok = !d.dead &&
                 ec3_ok(di, cudaStreamSynchronize(d.compute_stream), "glu sync");   // D2H of fused rows
+            d.glusync_us += ggml_time_us() - gs0;
+            d.glusync_n++;
             for (int i = 0; i < f.n; i++) {
                 char * row = (char *)dst_data + (size_t)f.rows[i] * dst_nb1;
                 if (gok) memcpy(row, d.h_out + (size_t)i * f.n_out, f.n_out * sizeof(float));
@@ -1630,6 +1646,10 @@ static void ec3_stats(void) {
                     (double)(d.t_plan_us + d.t_disp_us + d.t_coll_us) / d.n_nodes);
             EC3_LOG("[ec3] dev=%d redirect: claims=%lld miss-rows-up=%lld fused-layers=%lld\n",
                     i, d.redirect_claims, d.redirect_misses_up, d.fused_layers);
+            EC3_LOG("[ec3] dev=%d stickout: glu=%.1fus(n=%lld) down-ready=%lld down-wait=%.1fus(n=%lld)\n",
+                    i, d.glusync_n ? (double)d.glusync_us/d.glusync_n : 0.0, d.glusync_n,
+                    d.evt_ready,
+                    d.evt_wait_n ? (double)d.evt_wait_us/d.evt_wait_n : 0.0, d.evt_wait_n);
             EC3_LOG("[ec3] dev=%d coll-by-role: gate=%.1fus(n=%lld) up=%.1fus(n=%lld) down=%.1fus(n=%lld)\n", i,
                     d.n_coll_role[0] ? (double)d.t_coll_role_us[0]/d.n_coll_role[0] : 0.0, d.n_coll_role[0],
                     d.n_coll_role[1] ? (double)d.t_coll_role_us[1]/d.n_coll_role[1] : 0.0, d.n_coll_role[1],

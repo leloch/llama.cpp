@@ -2,6 +2,7 @@
 #include "gguf.h"
 
 #include <cstring>
+#include <sys/stat.h>
 
 #include "log.h"
 
@@ -179,7 +180,7 @@ static long common_ec3_expert_kib_in_file(const char * path, int64_t n_expert) {
     return kib;
 }
 
-static bool common_ec3_prefers_cpu_moe(const char * path_model) {
+static bool common_ec3_prefers_cpu_moe(const char * path_model, size_t usable_vram, size_t n_devices) {
     const char * e = getenv("LLAMA_EC3");
     if (e && atoi(e) == 0) return false;            // explicitly off
     long min_kb = 256;
@@ -202,20 +203,37 @@ static bool common_ec3_prefers_cpu_moe(const char * path_model) {
     if (n_expert <= 0) return false;
 
     long kib = common_ec3_expert_kib_in_file(path_model, n_expert);
-    if (kib < 0) {
-        // split ggufs scatter tensors across parts; walk a few more parts
+    size_t model_bytes = 0;
+    {
+        // total bytes across split parts (placement economics needs the ratio)
         const char * tag = strstr(path_model, "-00001-of-");
-        if (tag) {
-            for (int part = 2; part <= 4 && kib < 0; part++) {
-                std::string p(path_model);
+        int n_parts = 1;
+        if (tag) n_parts = atoi(tag + strlen("-00001-of-"));
+        for (int part = 1; part <= (n_parts > 0 ? n_parts : 1); part++) {
+            std::string p(path_model);
+            if (tag) {
                 char rep_[16];
                 snprintf(rep_, sizeof(rep_), "-%05d-of-", part);
                 p.replace(tag - path_model, strlen("-00001-of-"), rep_);
+            }
+            struct stat st;
+            if (stat(p.c_str(), &st) == 0) model_bytes += (size_t)st.st_size;
+            if (kib < 0 && part >= 2) {
                 kib = common_ec3_expert_kib_in_file(p.c_str(), n_expert);
             }
         }
     }
-    return kib >= min_kb;
+    if (kib < min_kb) return false;
+
+    // Placement economics, calibrated on 6 measured configs (see
+    // EC3_READINESS.md + matrix): the dynamic cache beats a static partial
+    // placement only for LARGE spills (static could fit < ~55% of the model),
+    // and on few devices only with big experts (per-device dispatch-chain
+    // serialization: 122B/MiniMax on one 3090 lose 6-18%, 4x 3090 wins).
+    const double spill_ratio = usable_vram > 0 ? (double)model_bytes / (double)usable_vram : 99.0;
+    if (spill_ratio < 1.8) return false;
+    if (n_devices < 2 && kib < 2048) return false;
+    return true;
 }
 
 static void common_params_fit_impl(
@@ -839,7 +857,11 @@ static void common_params_fit_impl(
         for (size_t id = 0; id < nd; id++) {
             n_dense_only += ngl_per_device[id].n_part;
         }
-        if (n_dense_only > 0 && common_ec3_prefers_cpu_moe(path_model)) {
+        size_t usable_vram = 0;
+        for (size_t id = 0; id < nd; id++) {
+            usable_vram += dmds_full[id].free > margins[id] ? dmds_full[id].free - margins[id] : 0;
+        }
+        if (n_dense_only > 0 && common_ec3_prefers_cpu_moe(path_model, usable_vram, nd)) {
             LOG_INF("%s: experts cannot all fit in VRAM; expert cache active -> "
                     "keeping ALL experts on CPU, spare VRAM goes to the dynamic cache "
                     "(LLAMA_EC3=0 restores static placement)\n", __func__);

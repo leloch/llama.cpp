@@ -700,20 +700,51 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
             if (g.budget_mb > 0 && (g.budget_mb << 20) < avail) {
                 avail = g.budget_mb << 20;
             }
-            double total_w = 0.0;
+            // Role-group budgeting. Mixed-quant models (UD-*_XL) fragment one
+            // role into many (size, type) shapes; naive per-shape weighting
+            // hands each fragment a sliver below the slot floor and the whole
+            // role dies (measured: every down projection ran CPU-only on a
+            // 24 GB device while gate/up hit 77%). Budget by role group first,
+            // then allocate within the group largest-first, folding the share
+            // of dead fragments into the survivors.
+            auto shape_w = [](const ec3_discovery::shape & sh) {
+                return (double)sh.size * (sh.n_tensors > 0 ? sh.n_tensors : 1);
+            };
+            auto is_paired_sh = [&](const ec3_discovery::shape & sh) {
+                return g.fuse && (sh.roles & 0b11) == 0b11;
+            };
+            double w_pair = 0.0, w_rest = 0.0;
             for (auto & sh : pend) {
-                total_w += (double)sh.size * (sh.n_tensors > 0 ? sh.n_tensors : 1);
+                (is_paired_sh(sh) ? w_pair : w_rest) += shape_w(sh);
             }
-            for (auto & sh : pend) {
-                const double w = (double)sh.size * (sh.n_tensors > 0 ? sh.n_tensors : 1);
-                const bool paired = g.fuse && (sh.roles & 0b11) == 0b11;
-                // census may be incomplete on this device (visit-order dependent):
-                // cap any single pool so a later-discovered shape always fits
-                size_t budget = (size_t)(avail * (w / total_w));
-                const size_t cap = (size_t)(avail * 0.60);
-                if (budget > cap) budget = cap;
-                const int64_t max_entries = (paired ? sh.n_tensors / 2 : sh.n_tensors) * sh.n_expert;
-                ec3_pool_alloc(di, sh.size, sh.wtype, budget, paired, max_entries);
+            const double w_all = w_pair + w_rest;
+            std::vector<const ec3_discovery::shape *> order;
+            for (auto & sh : pend) order.push_back(&sh);
+            std::sort(order.begin(), order.end(),
+                      [&](const ec3_discovery::shape * a, const ec3_discovery::shape * b) {
+                          return shape_w(*a) > shape_w(*b);
+                      });
+            size_t group_left[2] = {                       // [0]=paired, [1]=rest
+                w_all > 0 ? (size_t)(avail * (w_pair / w_all)) : 0,
+                w_all > 0 ? (size_t)(avail * (w_rest / w_all)) : 0,
+            };
+            double group_w_left[2] = { w_pair, w_rest };
+            for (const auto * shp_p : order) {
+                const auto & sh = *shp_p;
+                const bool paired = is_paired_sh(sh);
+                const int  gidx   = paired ? 0 : 1;
+                if (group_w_left[gidx] <= 0.0) continue;
+                size_t budget = (size_t)(group_left[gidx] * (shape_w(sh) / group_w_left[gidx]));
+                const int64_t max_entries = (paired ? sh.n_tensors / 2 : sh.n_tensors) * (int64_t)sh.n_expert;
+                const size_t need = (size_t)max_entries * sh.size * (paired ? 2 : 1);
+                if (budget > need) budget = need;          // never strand bytes in caps
+                const size_t before = budget;
+                if (ec3_pool_alloc(di, sh.size, sh.wtype, budget, paired, max_entries)) {
+                    group_left[gidx] -= before;            // consumed (approx; slack folds forward)
+                }
+                // dead fragments consume nothing: their share flows to the
+                // next shapes of the same group automatically
+                group_w_left[gidx] -= shape_w(sh);
             }
         }
         pend.clear();

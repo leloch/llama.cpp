@@ -104,3 +104,23 @@ Cross-cutting safe results: 754B server survived an 11,105-token prompt with poo
 8. **HIP/MUSA stay unvalidated** (deliberately gated off); enabling them later is a new measurement campaign, not a flag flip.
 9. **Upstream appetite is unproven.** #20757 — nearly this exact feature with a working PoC — was closed without maintainer engagement; even a perfect proposal may stall, and the AI-provenance constraint means the submission must be substantially re-authored by a human who can defend every line.
 10. **Single-process scope:** even with session handles, the cache is per-process VRAM; multi-process serving on one GPU gets no coordination and pools from one server starve another (standard for llama.cpp, but worth stating).
+---
+
+# RESOLUTION (2026-06-12) — the always-on roadmap was executed
+
+All [A]-track items implemented and empirically validated (commits 59c87c367..45a163fa6):
+B1 epoch-scoped fuse (re-enabled, PPL-clean, 19.44 best bench), B3 type allowlist,
+B4 key-mixing + buffer-free invalidation + engagement guard, B5 checked-CUDA
+degradation + per-device disable + allocator trim hook, M1 stable-census pools
+(server regression fixed), M3 idle-worker backfill + prompt-phase discovery
+(first server request 15.7, second 20.0), M4 slot caps, M2 spill-aware fit
+placement, M12 default-on + baseline-sampled bail-out (trip validated on a
+thrash config: detected 72us vs 43us, freed VRAM, recovered to within 6% of CPU).
+
+Zero-config results: 754B `-fitt 1024` 17.0 (was 14.09 no-op); bare
+`llama-server -m` 754B: 14.1->16.8 t/s; 397B 30.92 (stock 28.22); 35B/122B
+dormant at full GPU speed. The 35B forced case flipped from -28% to +15%
+(gate lowered 1024->256 KB). DEFER retired (off, deprecated).
+
+Remaining [P]-track (upstream PR) items stand as written: human re-authorship
+gate (B6), CLI surface, GGML_LOG migration, CI tests, integration shape.

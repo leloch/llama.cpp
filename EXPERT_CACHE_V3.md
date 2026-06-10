@@ -30,9 +30,19 @@ Cached rows run the same mmvq kernels used for GPU-resident experts.
 
 ## Usage
 
+**Zero configuration.** The cache is always on (like `--fit`) and configures
+itself:
+
 ```bash
-LLAMA_EC3=1 ./llama-server -m <model> -ngl 99 -ncmoe 99 -fa on -t <n_cores> ...
+./llama-server -m <model> -fa on -t <n_cores>     # that's it
 ```
+
+When fit detects that a MoE model's experts cannot all stay in VRAM, it keeps
+ALL of them on the CPU and the spare VRAM becomes the dynamic cache (measured
+faster than any static partial placement). Fully-fitting models keep the all-
+GPU placement and the cache stays dormant (verified zero residue). A baseline-
+sampled bail-out disables the cache at runtime — freeing its VRAM — if it ever
+measures itself losing on the actual workload. `LLAMA_EC3=0` opts out.
 
 VRAM is sized automatically (free memory minus a 3 GB/device reserve, split
 across per-shape pools, allocated on demand at the first decoded tokens).
@@ -40,14 +50,16 @@ Everything else is optional tuning:
 
 | Env | Default | Meaning |
 |---|---|---|
-| `LLAMA_EC3` | off | `1` enables the cache |
+| `LLAMA_EC3` | on (auto) | `0` disables the cache and restores static fit placement |
 | `LLAMA_EC3_BUDGET_MB` | auto | per-device cache budget cap |
 | `LLAMA_EC3_RESERVE_MB` | 3072 | VRAM never touched (the CUDA pool grows lazily after init; stealing it crashes decode) |
 | `LLAMA_EC3_NDEV` | all | number of CUDA devices to stripe over |
 | `LLAMA_EC3_INSERTS` | 8 | max insert enqueues per node visit |
 | `LLAMA_EC3_WORKERS` | 4 | background copy threads (pinned staging + own streams) |
-| `LLAMA_EC3_MIN_EXPERT_KB` | 1024 | skip models with experts smaller than this (too little CPU work to amortize dispatch — e.g. 35B-A3B class) |
-| `LLAMA_EC3_DEFER` | on | defer a gate node's sync into the same layer's up node |
+| `LLAMA_EC3_MIN_EXPERT_KB` | 256 | skip models with experts smaller than this (also gates the fit placement preference) |
+| `LLAMA_EC3_PREFETCH` | on | idle-worker backfill: pre-warm pools during prompts/idle (cold-start fix) |
+| `LLAMA_EC3_MAX_BATCH` | 1 | decode batches up to this size use the cache (parallel serving / spec-verify) |
+| `LLAMA_EC3_DEFER` | off | (deprecated) gate-sync deferral; superseded by FUSE |
 | `LLAMA_EC3_REUSE` | on | reuse the quantized activation between gate and up |
 | `LLAMA_EC3_FUSE` | on | fused gate+up+SwiGLU GPU dispatch (paired pools; engages per layer after the GLU wiring is observed — GLM yes, Qwen3.6 no) |
 | `LLAMA_EC3_REDIRECT` | on | down-projection dst handoff: rows relayed via pinned image to the consumer's stream, no host syncs |

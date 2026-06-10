@@ -1,4 +1,7 @@
 #include "fit.h"
+#include "gguf.h"
+
+#include <cstring>
 
 #include "log.h"
 
@@ -148,6 +151,71 @@ std::vector<llama_device_memory_data> common_get_device_memory_data(
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
 
     return ret;
+}
+
+// Expert cache (EC3) placement preference: when a MoE model's experts cannot
+// all return to VRAM anyway, leaving ALL of them on the CPU and giving the
+// spare VRAM to the dynamic expert cache measures faster than any static
+// partial placement (754B: 19.2 vs 14.0 t/s; 397B: 33.3 vs 28.2). Only models
+// above the cache's expert-size gate qualify — below it the cache would stay
+// dormant and a static placement is strictly better.
+// scan one gguf file for a routed-expert tensor; returns -1 if none found,
+// else per-expert KiB (needs n_expert > 0)
+static long common_ec3_expert_kib_in_file(const char * path, int64_t n_expert) {
+    struct gguf_init_params ip = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
+    struct gguf_context * gctx = gguf_init_from_file(path, ip);
+    if (!gctx) return -1;
+    long kib = -1;
+    const int64_t n_tensors = gguf_get_n_tensors(gctx);
+    for (int64_t i = 0; i < n_tensors; i++) {
+        const char * name = gguf_get_tensor_name(gctx, i);
+        if (!strstr(name, "ffn_up_exps") && !strstr(name, "ffn_gate_exps")) continue;
+        if (n_expert > 0) {
+            kib = (long)(gguf_get_tensor_size(gctx, i) / n_expert / 1024);
+        }
+        break;
+    }
+    gguf_free(gctx);
+    return kib;
+}
+
+static bool common_ec3_prefers_cpu_moe(const char * path_model) {
+    const char * e = getenv("LLAMA_EC3");
+    if (e && atoi(e) == 0) return false;            // explicitly off
+    long min_kb = 256;
+    if (const char * m = getenv("LLAMA_EC3_MIN_EXPERT_KB")) min_kb = atol(m);
+
+    // expert count from part-1 metadata
+    int64_t n_expert = 0;
+    {
+        struct gguf_init_params ip = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
+        struct gguf_context * gctx = gguf_init_from_file(path_model, ip);
+        if (!gctx) return false;
+        const int64_t kid = gguf_find_key(gctx, "general.architecture");
+        if (kid >= 0) {
+            std::string arch = gguf_get_val_str(gctx, kid);
+            const int64_t kex = gguf_find_key(gctx, (arch + ".expert_count").c_str());
+            if (kex >= 0) n_expert = gguf_get_val_u32(gctx, kex);
+        }
+        gguf_free(gctx);
+    }
+    if (n_expert <= 0) return false;
+
+    long kib = common_ec3_expert_kib_in_file(path_model, n_expert);
+    if (kib < 0) {
+        // split ggufs scatter tensors across parts; walk a few more parts
+        const char * tag = strstr(path_model, "-00001-of-");
+        if (tag) {
+            for (int part = 2; part <= 4 && kib < 0; part++) {
+                std::string p(path_model);
+                char rep_[16];
+                snprintf(rep_, sizeof(rep_), "-%05d-of-", part);
+                p.replace(tag - path_model, strlen("-00001-of-"), rep_);
+                kib = common_ec3_expert_kib_in_file(p.c_str(), n_expert);
+            }
+        }
+    }
+    return kib >= min_kb;
 }
 
 static void common_params_fit_impl(
@@ -619,6 +687,12 @@ static void common_params_fit_impl(
         return;
     }
 
+    // expert-cache placement preference: snapshot the all-experts-on-CPU
+    // placement; if step 4 cannot return ALL experts to VRAM we prefer this
+    // snapshot (spare VRAM goes to the dynamic cache instead of a static mix)
+    const std::vector<ngl_t> ngl_all_cpu_moe = ngl_per_device;
+    const std::vector<ggml_backend_buffer_type_t> overflow_bufts_cpu_moe = overflow_bufts;
+
     // step 4: for a MoE model where all dense tensors fit,
     //     convert the dense-only layers in the back to full layers in the front until all devices are full
     // essentially the same procedure as for the dense-only layers except front-to-back
@@ -760,6 +834,19 @@ static void common_params_fit_impl(
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
     }
 
+    {
+        uint32_t n_dense_only = 0;
+        for (size_t id = 0; id < nd; id++) {
+            n_dense_only += ngl_per_device[id].n_part;
+        }
+        if (n_dense_only > 0 && common_ec3_prefers_cpu_moe(path_model)) {
+            LOG_INF("%s: experts cannot all fit in VRAM; expert cache active -> "
+                    "keeping ALL experts on CPU, spare VRAM goes to the dynamic cache "
+                    "(LLAMA_EC3=0 restores static placement)\n", __func__);
+            set_ngl_tensor_split_tbo(ngl_all_cpu_moe, overflow_bufts_cpu_moe, *mparams);
+            return;
+        }
+    }
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
 }
 

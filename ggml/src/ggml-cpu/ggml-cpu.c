@@ -1561,6 +1561,7 @@ static void ggml_compute_forward_mul_mat_id(
     // expert-cache v3 state (set on thread 0 only; other threads keep dev = -1)
     enum { EC3_MAX_TOPK = 64 };
     int           ec3_dev = -1;
+    int64_t       ec3_t0 = 0;
     int           ec3_n_hits = 0;
     int32_t       ec3_slot_idx[EC3_MAX_TOPK];   // per-k slot index, -1 = miss
     int32_t       ec3_compact[EC3_MAX_TOPK];    // slot indices of hits, in order
@@ -1629,6 +1630,7 @@ static void ggml_compute_forward_mul_mat_id(
         // at the end of this function, before the node completes.
         if (ggml_expert_cache_v3.begin && src1->type == GGML_TYPE_F32 &&
             n_ids * ids->ne[1] <= EC3_MAX_TOPK) {
+            ec3_t0 = ggml_time_us();
             ec3_dev = ggml_expert_cache_v3.begin(src0->name, src0->data, nb02,
                                                  ne00, ne01, (int) type, ne02, ids->ne[1]);
             if (ec3_dev >= 0) {
@@ -1756,6 +1758,11 @@ static void ggml_compute_forward_mul_mat_id(
     // this one) is done before the next node reads dst.
     if (ec3_dev >= 0 && ec3_n_hits > 0) {
         ggml_expert_cache_v3.collect(ec3_dev, ec3_n_hits, ec3_rows, ne0);
+    }
+    // bail-out judge: node wall-time samples for both phases (-3 = pure-CPU
+    // baseline window, >= 0 = cache-engaged)
+    if (ith == 0 && ggml_expert_cache_v3.node_time && (ec3_dev >= 0 || ec3_dev == -3)) {
+        ggml_expert_cache_v3.node_time(ec3_dev, ggml_time_us() - ec3_t0);
     }
 }
 

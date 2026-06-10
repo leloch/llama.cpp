@@ -250,6 +250,24 @@ struct ec3_global {
     bool redirect_on = true;       // LLAMA_EC3_REDIRECT=0 to disable
 
     long long collect_calls = 0;
+
+    // ---- baseline-sampled bail-out ----
+    // Phase A (after pools build): eligible nodes run pure-CPU while their wall
+    // time builds the baseline EWMA (begin returns -3 so the kernel reports the
+    // sample). Phase B: cache engages; node walls feed the engaged EWMA. Once
+    // enough engaged samples accumulate, sustained engaged > baseline * 1.05
+    // disables the cache and frees its VRAM: the placement bet failed on this
+    // workload and the CPU path is the better config.
+    struct {
+        long long eligible_seen = 0;       // counts begins after pools exist
+        double    base_ewma = 0.0;         // pure-CPU node wall, us
+        double    on_ewma   = 0.0;         // cache-engaged node wall, us
+        long long base_n = 0, on_n = 0;
+        int       strikes = 0;
+        bool      tripped = false;
+    } bail;
+    static constexpr long long BAIL_WARM   = 500;   // ignored (first-touch effects)
+    static constexpr long long BAIL_SAMPLE = 2750;  // baseline window end
 };
 
 // intentionally leaked: detached worker threads reference this state through
@@ -752,6 +770,13 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
         // prompt processing: pools may now exist and the backfill workers warm
         // them in parallel with the prompt; the decode path stays untouched
         return -1;
+    }
+
+    // bail-out phases (decode visits on a working pool only)
+    if (!g.bail.tripped) {
+        const long long vis = g.bail.eligible_seen++;
+        if (vis < ec3_global::BAIL_WARM) return -1;        // warmup: no sample
+        if (vis < ec3_global::BAIL_SAMPLE) return -3;      // pure CPU + timing sample
     }
 
     // paired pools share ONE entry per (blk, expert): key by blk + the GATE
@@ -1512,6 +1537,37 @@ static void ec3_invalidate(const void * base, size_t size) {
     }
 }
 
+// ---- API: node wall-time samples (bail-out) ---------------------------------------------
+
+static void ec3_node_time(int code, int64_t us) {
+    if (g.bail.tripped) return;
+    auto & b = g.bail;
+    if (code == -3) {
+        b.base_ewma = b.base_n == 0 ? (double)us : b.base_ewma + ((double)us - b.base_ewma) / 256.0;
+        b.base_n++;
+        return;
+    }
+    if (code < 0) return;
+    b.on_ewma = b.on_n == 0 ? (double)us : b.on_ewma + ((double)us - b.on_ewma) / 256.0;
+    b.on_n++;
+    if (b.base_n < 1000 || b.on_n < 5000) return;
+    if (b.on_n % 256 != 0) return;
+    if (b.on_ewma > b.base_ewma * 1.05) {
+        if (++b.strikes >= 4) {
+            b.tripped = true;
+            EC3_LOG("[ec3] bail-out: cache-engaged nodes average %.0fus vs %.0fus pure-CPU — "
+                    "disabling the cache and freeing its VRAM for this run\n",
+                    b.on_ewma, b.base_ewma);
+            for (int di = 0; di < g.n_dev; di++) {
+                ggml_expert_cache_v3_trim(di);
+            }
+            g.enabled = false;
+        }
+    } else {
+        b.strikes = 0;
+    }
+}
+
 // ---- API: stats ----------------------------------------------------------------------
 
 static void ec3_stats(void) {
@@ -1662,8 +1718,12 @@ static void ec3_selftest(void) {
 // ---- registration ----------------------------------------------------------------------
 
 void ggml_expert_cache_v3_register(void) {
+    // always-on auto mode: active unless explicitly disabled. Engagement is
+    // still gated per model (expert size, type allowlist, census) and a
+    // baseline-sampled bail-out disables the cache if it ever measures itself
+    // losing on this workload.
     const char * v = getenv("LLAMA_EC3");
-    g.enabled = v && atoi(v) > 0;
+    g.enabled = !(v && atoi(v) <= 0);
     if (!g.enabled) return;
 
     int dev_count = 0;
@@ -1710,6 +1770,7 @@ void ggml_expert_cache_v3_register(void) {
     ggml_expert_cache_v3.redirect_finalize = ec3_redirect_finalize;
     ggml_expert_cache_v3.glu_hits          = ec3_glu_hits;
     ggml_expert_cache_v3.invalidate        = ec3_invalidate;
+    ggml_expert_cache_v3.node_time         = ec3_node_time;
     if (const char * e = getenv("LLAMA_EC3_REDIRECT")) g.redirect_on = atoi(e) > 0;
 
     EC3_LOG("[ec3] enabled: n_dev=%d budget=%s inserts/plan=%d workers=%d stats_every=%d\n",

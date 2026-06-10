@@ -80,6 +80,10 @@ struct ggml_expert_cache_v3_api {
     // insert jobs sourced from the range and resets per-block tensor-base
     // learning. Must be called before the memory is unmapped/freed.
     void (*invalidate)(const void * base, size_t size);
+
+    // Node wall-time sample for the bail-out judge. code is begin()'s return
+    // value: -3 = pure-CPU baseline sample, >= 0 = cache-engaged sample.
+    void (*node_time)(int code, int64_t wall_us);
 };
 
 // Zero-initialized in ggml-backend.cpp; populated by the CUDA backend in

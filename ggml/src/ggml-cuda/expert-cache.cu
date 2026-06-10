@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -164,6 +165,16 @@ struct ec3_global {
 
     ec3_device dev[EC3_MAX_DEV];
 
+    // prefetch backfill cursor (guarded by mu): walks (blk, eid) space and
+    // enqueues nothing — workers pull directly when the demand queue is empty
+    struct {
+        bool enabled = true;       // LLAMA_EC3_PREFETCH=0 to disable
+        bool active  = false;      // pools exist somewhere
+        int  blk     = 0;          // next block to backfill
+        int  eid     = 0;          // next expert within the block
+        bool done    = false;
+    } backfill;
+
     // insert queue + workers
     std::mutex              mu;  // guards pools/queue of all devices
     std::condition_variable cv;
@@ -204,6 +215,14 @@ struct ec3_global {
     // the CPU GLU hook was OBSERVED matching that layer's gate/up dst pair
     // (learned on the first decode tokens) — a graph without the hook firing
     // would otherwise compute silu(garbage)*garbage for the skipped rows.
+    // per-blk facts for prefetch backfill (written by begin, read by workers
+    // under mu at job-pull time; plain arrays, blk-indexed)
+    int8_t       blk_pair_pool[1024];    // paired-pool index on the owning dev, -1 unknown
+    int8_t       blk_down_pool[1024];    // down-pool index, -1 unknown
+    int          blk_n_expert[1024] = {};
+    uint64_t     blk_down_kb[1024] = {}; // down key base (name-hash ^ ptr-hash)
+    const void * blk_down_base[1024] = {};
+
     bool fuse = true;                    // LLAMA_EC3_FUSE=0 to disable. Stale-entry
                                          // hazard (EC3_READINESS.md B1) closed by
                                          // gate-begin epoch invalidation + up-node
@@ -299,6 +318,55 @@ static void ec3_lru_push_back(ec3_pool & p, int idx) {
 
 // ---- insert workers ----------------------------------------------------------
 
+// pick the next backfill insert (g.mu held). Walks blocks in order; for each
+// block inserts the paired gate/up entry and the down entry for every expert
+// until the owning pools fill. Returns false when the walk is exhausted.
+static bool ec3_backfill_next(ec3_job & out) {
+    for (; g.backfill.blk < 1024; g.backfill.blk++, g.backfill.eid = 0) {
+        const int blk = g.backfill.blk;
+        const int di  = blk % g.n_dev;
+        ec3_device & d = g.dev[di];
+        if (d.dead || d.n_pools == 0) continue;
+        if (g.blk_pair_pool[blk] < 0 && g.blk_down_pool[blk] < 0) continue;   // never visited
+
+        // eid cursor covers the pair entry and the down entry for each expert:
+        // unit = eid*2 (pair) and eid*2+1 (down)
+        const int n_exp = g.blk_n_expert[blk];
+        while (g.backfill.eid < 2 * n_exp) {
+            const int unit = g.backfill.eid++;
+            const int eid  = unit >> 1;
+            const bool want_pair = (unit & 1) == 0;
+
+            const int pi = want_pair ? g.blk_pair_pool[blk] : g.blk_down_pool[blk];
+            if (pi < 0 || pi >= d.n_pools) continue;
+            ec3_pool & p = d.pools[pi];
+            if (!p.slab || p.n_used >= p.n_slots) continue;
+            if (want_pair && (!p.paired || !g.role_base[0][blk] || !g.role_base[1][blk])) continue;
+            if (!want_pair && !g.blk_down_base[blk]) continue;
+
+            const uint64_t key = want_pair
+                ? ec3_key(0xEC3000000000000ULL ^ ((uint64_t)blk << 32) ^ ec3_ptr_hash(g.role_base[0][blk]), eid)
+                : ec3_key(g.blk_down_kb[blk], eid);
+            if (p.map.count(key)) continue;
+
+            const int si = p.n_used++;
+            p.slots[si] = ec3_slot{key, -1, -1, false, true};
+            ec3_lru_push_back(p, si);
+            p.map[key] = si;
+            d.inserts++;
+            out = ec3_job{di, pi, key, si,
+                          want_pair ? (const char *)g.role_base[1][blk] + (size_t)eid * p.expert_size
+                                    : (const char *)g.blk_down_base[blk] + (size_t)eid * p.expert_size,
+                          want_pair ? (const char *)g.role_base[0][blk] + (size_t)eid * p.expert_size
+                                    : nullptr,
+                          p.expert_size};
+            return true;
+        }
+    }
+    g.backfill.done = true;
+    return false;
+}
+
 static void ec3_worker_main(int wid) {
     // per-worker pinned staging buffer + per-device copy streams: the host
     // memcpy runs at RAM speed on this thread, the H2D is a true async DMA on
@@ -312,9 +380,15 @@ static void ec3_worker_main(int wid) {
         ec3_job job;
         {
             std::unique_lock<std::mutex> lk(g.mu);
-            g.cv.wait(lk, []{ return !g.queue.empty(); });
+            while (g.queue.empty()) {
+                if (g.backfill.enabled && g.backfill.active && !g.backfill.done && ec3_backfill_next(job)) {
+                    goto have_job;
+                }
+                g.cv.wait_for(lk, std::chrono::milliseconds(50));
+            }
             job = g.queue.front();
             g.queue.pop_front();
+        have_job:
             g.inflight_src[wid] = job.src;
             g.inflight_len[wid] = job.bytes;
         }
@@ -491,8 +565,9 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
                      int64_t n_in, int64_t n_out, int wtype, int64_t n_expert, int64_t n_tokens) {
     GGML_UNUSED(n_in); GGML_UNUSED(n_out);
 
-    if (!g.enabled || n_tokens < 1 || n_tokens > g.max_batch) return -1;
+    if (!g.enabled || n_tokens < 1) return -1;
     if (expert_size < g.min_expert_bytes) return -1;
+    const bool pp_phase = n_tokens > g.max_batch;   // discovery-only visit
 
     // single-owner engagement: begin..collect carries per-node state in g.cur_*;
     // a second thread (concurrent llama_context) gets a clean refusal instead
@@ -659,6 +734,25 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
     g.cur_role = role;
 
     EC3_DBG("[ec3-dbg] begin %s dev=%d pool=%d role=%d\n", name, di, pi, role);
+
+    if (blk >= 0 && blk < 1024) {
+        g.blk_n_expert[blk] = (int)n_expert;
+        if (d.pools[pi].paired && (role == 0 || role == 1)) {
+            g.blk_pair_pool[blk] = (int8_t)pi;
+            g.role_base[role][blk] = host_base;   // backfill pair sources (also pre-PP-bail)
+        } else if (role == 2) {
+            g.blk_down_pool[blk] = (int8_t)pi;
+            g.blk_down_kb[blk]   = kb ^ ec3_ptr_hash(host_base);
+            g.blk_down_base[blk] = host_base;
+        }
+        g.backfill.active = true;
+    }
+
+    if (pp_phase) {
+        // prompt processing: pools may now exist and the backfill workers warm
+        // them in parallel with the prompt; the decode path stays untouched
+        return -1;
+    }
 
     // paired pools share ONE entry per (blk, expert): key by blk + the GATE
     // tensor's host base (two models in one process must never alias — names
@@ -1591,6 +1685,9 @@ void ggml_expert_cache_v3_register(void) {
     if (const char * e = getenv("LLAMA_EC3_STRIPE"))        g.stripe = atoi(e) > 0;
     if (const char * e = getenv("LLAMA_EC3_FUSE"))          g.fuse = atoi(e) > 0;
     if (const char * e = getenv("LLAMA_EC3_MAX_BATCH"))     { int n = atoi(e); if (n >= 1 && n <= 8) g.max_batch = n; }
+    if (const char * e = getenv("LLAMA_EC3_PREFETCH"))      g.backfill.enabled = atoi(e) > 0;
+    memset(g.blk_pair_pool, -1, sizeof(g.blk_pair_pool));
+    memset(g.blk_down_pool, -1, sizeof(g.blk_down_pool));
     if (g.stripe && g.fuse) {
         g.fuse = false;  // pair state is per-device; striping splits roles across devices
         EC3_LOG("[ec3] stripe mode: fuse disabled\n");

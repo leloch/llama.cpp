@@ -93,6 +93,11 @@ struct ec3_device {
     // stats
     long long hits = 0, misses = 0, inserts = 0, evictions = 0;
     long long insert_skips = 0, queued_misses = 0;
+    // miss decomposition (counters only, no behavior change)
+    long long pool_hits[EC3_MAX_POOLS] = {}, pool_miss[EC3_MAX_POOLS] = {};
+    long long miss_compulsory = 0, miss_capacity = 0, miss_admission = 0;
+    long long skip_throttle = 0, skip_budget = 0, skip_qfull = 0, skip_lrubusy = 0;
+    std::unordered_set<uint64_t> ever_seen, ever_inserted;
     // per-phase wall time (thread-0 serial cost), microseconds
     long long t_plan_us = 0, t_disp_us = 0, t_coll_us = 0, n_nodes = 0;
 };
@@ -114,6 +119,8 @@ struct ec3_global {
                                  // grows lazily AFTER our init; stealing it
                                  // crashes the model mid-decode (measured)
     int    inserts_per_plan = 8; // max inserts enqueued per plan() call
+    int    throttle_mod     = 8; // at capacity admit 1-in-N misses (LLAMA_EC3_THROTTLE)
+    bool   greedy_last      = false; // last pending pool takes all remaining avail
     int    queue_max        = 512;
     int    n_workers        = 4;
     size_t min_expert_bytes = 1u << 20; // skip models whose experts are too small
@@ -302,7 +309,10 @@ static bool ec3_pool_alloc(int di, size_t expert_size, int wtype, int n_shapes_p
     // leave room for the device's other not-yet-built pools. MoE models have
     // (at least) two expert shapes — gate/up and down — and discovery order is
     // not guaranteed, so never let a single pool claim more than half.
-    const int pool_div = n_shapes_pending > 2 ? n_shapes_pending : 2;
+    // LLAMA_EC3_GREEDY_LAST=1: the LAST pending shape takes ALL remaining avail
+    // (the half-divisor otherwise strands ~pool1-sized VRAM beyond the reserve).
+    int pool_div = n_shapes_pending > 2 ? n_shapes_pending : 2;
+    if (g.greedy_last && n_shapes_pending == 1) pool_div = 1;
     const size_t budget = avail / pool_div;
 
     int ns = (int)(budget / expert_size);
@@ -471,28 +481,45 @@ static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) 
                 ec3_lru_push_back(p, si);
                 slot_idx[k] = si;
                 d.hits++;
+                d.pool_hits[g.cur_pool]++;
                 n_hits++;
             } else {
                 // insert still queued/in-flight: CPU computes the row this time
                 d.queued_misses++;
                 d.misses++;
+                d.pool_miss[g.cur_pool]++;
             }
             continue;
         }
 
         d.misses++;
+        d.pool_miss[g.cur_pool]++;
+        if (d.ever_seen.insert(key).second) {
+            d.miss_compulsory++;
+        } else if (d.ever_inserted.count(key)) {
+            d.miss_capacity++;   // was in cache once, evicted, needed again
+        } else {
+            d.miss_admission++;  // seen before but never admitted
+        }
 
         // ---- enqueue async insert (budgeted) ----
-        if (inserts_left <= 0 || (int)g.queue.size() >= g.queue_max) {
+        if (inserts_left <= 0) {
             d.insert_skips++;
+            d.skip_budget++;
+            continue;
+        }
+        if ((int)g.queue.size() >= g.queue_max) {
+            d.insert_skips++;
+            d.skip_qfull++;
             continue;
         }
         // admission throttle at capacity: when the pool is full, churn (evict +
         // re-copy on every miss) steals host RAM bandwidth from the CPU matmuls.
         // Admit only a fraction of misses so the content still adapts but the
         // copy traffic stays bounded.
-        if (p.n_used >= p.n_slots && (d.misses & 7) != 0) {
+        if (p.n_used >= p.n_slots && (d.misses % g.throttle_mod) != 0) {
             d.insert_skips++;
+            d.skip_throttle++;
             continue;
         }
 
@@ -503,7 +530,7 @@ static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) 
             int cand = p.lru_head;
             int guard = 0;
             while (cand >= 0 && p.slots[cand].queued && guard++ < 64) cand = p.slots[cand].next;
-            if (cand < 0 || p.slots[cand].queued) { d.insert_skips++; continue; }
+            if (cand < 0 || p.slots[cand].queued) { d.insert_skips++; d.skip_lrubusy++; continue; }
             si = cand;
             ec3_slot & old = p.slots[si];
             if (old.valid || old.queued) {
@@ -519,6 +546,7 @@ static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) 
         ec3_lru_push_back(p, si);
         p.map[key] = si;
         d.inserts++;
+        d.ever_inserted.insert(key);
         inserts_left--;
 
         g.queue.push_back(ec3_job{di, g.cur_pool, key, si, src, g.cur_expert_size});
@@ -743,6 +771,16 @@ static void ec3_stats(void) {
                 i, d.hits, tot, tot ? 100.0 * d.hits / tot : 0.0,
                 d.inserts, d.evictions, d.insert_skips, d.queued_misses,
                 used, slots, g.queue.size());
+        EC3_LOG("[ec3] dev=%d decomp: compulsory=%lld capacity=%lld admission=%lld inflight=%lld uniq-seen=%zu uniq-inserted=%zu | skips: throttle=%lld budget=%lld qfull=%lld lru=%lld\n",
+                i, d.miss_compulsory, d.miss_capacity, d.miss_admission, d.queued_misses,
+                d.ever_seen.size(), d.ever_inserted.size(),
+                d.skip_throttle, d.skip_budget, d.skip_qfull, d.skip_lrubusy);
+        for (int pi = 0; pi < d.n_pools; pi++) {
+            const long long ptot = d.pool_hits[pi] + d.pool_miss[pi];
+            EC3_LOG("[ec3] dev=%d pool[%d]: hits=%lld/%lld (%.1f%%) slots=%d slot=%zuKB\n",
+                    i, pi, d.pool_hits[pi], ptot, ptot ? 100.0 * d.pool_hits[pi] / ptot : 0.0,
+                    d.pools[pi].n_slots, d.pools[pi].expert_size >> 10);
+        }
         if (d.n_nodes > 0) {
             EC3_LOG("[ec3] dev=%d timing: nodes=%lld plan=%.1fus disp=%.1fus coll=%.1fus per-node total=%.1fus\n",
                     i, d.n_nodes,
@@ -876,6 +914,8 @@ void ggml_expert_cache_v3_register(void) {
     if (const char * e = getenv("LLAMA_EC3_NDEV"))      { int n = atoi(e); if (n > 0 && n < g.n_dev) g.n_dev = n; }
     if (const char * e = getenv("LLAMA_EC3_BUDGET_MB")) g.budget_mb = (size_t)atoll(e);
     if (const char * e = getenv("LLAMA_EC3_INSERTS"))   g.inserts_per_plan = atoi(e);
+    if (const char * e = getenv("LLAMA_EC3_THROTTLE"))  { g.throttle_mod = atoi(e); if (g.throttle_mod < 1) g.throttle_mod = 1; }
+    if (const char * e = getenv("LLAMA_EC3_GREEDY_LAST")) g.greedy_last = atoi(e) != 0;
     if (const char * e = getenv("LLAMA_EC3_WORKERS"))   { int n = atoi(e); if (n > 0 && n <= 16) g.n_workers = n; }
     if (const char * e = getenv("LLAMA_EC3_STATS"))     g.stats_every = atoi(e);
     if (const char * e = getenv("LLAMA_EC3_MIN_EXPERT_KB")) g.min_expert_bytes = (size_t)atoll(e) << 10;

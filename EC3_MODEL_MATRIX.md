@@ -29,6 +29,9 @@ Build: branch v3-expert-cache @ 83918dbee+. "Vanilla" = same binary, LLAMA_EC3=0
 | Qwen3-30B-A3B | **90.6** | 67.4 | **+34.4%** | IDENTICAL |
 | ERNIE-4.5-21B | **111.6** | 77.4 | **+44.3%** | IDENTICAL |
 | Qwen3.6-35B-A3B | **89.0** | 77.3 | **+15%** | PPL-validated |
+| gpt-oss-120b MXFP4/F16 | **60.7** | 44.1 | **+37.8%** | IDENTICAL (fuse refused on SWIGLU_OAI) |
+| gpt-oss-20b | **88.3** | 65.3 | **+35.3%** | IDENTICAL |
+| OLMoE-7B-A1B Q3_K_M | **231.4** | 204.2 | **+13.3%** | IDENTICAL (tiny-expert extreme) |
 
 *vanilla figure = best stock config (fitt), stricter than same-placement.
 
@@ -39,6 +42,7 @@ Build: branch v3-expert-cache @ 83918dbee+. "Vanilla" = same binary, LLAMA_EC3=0
 | Qwen3-30B (8G) | 101.8 (static) | 103.1 | 90.7 | 69.0 | correct: static > best dynamic |
 | ERNIE-21B (6G) | **110.0 (dynamic)** | 108.8 | 97.8 | 78.1 | correct: big-expert exception wins |
 | gpt-oss-120b (22G) | 55.5 (dynamic) | 56.2 | — | — | parity (-1.2%, tolerated) |
+| gpt-oss-20b (5G) | **88.9 (dynamic)** | 87.8 | — | — | correct: dynamic wins |
 
 ### gpt-oss-120b adversarial correctness (forced, 4 GPU)
 SWIGLU_OAI + expert biases: fuse learning correctly refused (fused-layers=0),

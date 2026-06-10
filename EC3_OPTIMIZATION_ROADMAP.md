@@ -151,3 +151,34 @@ Hit-rate work above ~80% has near-zero or negative marginal t/s under the curren
 - **Previously closed, still closed**: bigger total budget (Run D re-confirmed: VRAM pressure makes it net negative), eviction-policy zoo, PP-driven fill, hybrid static placement, plain MTP spec-decode.
 
 Key paths: /home/user/llama.cpp-v3/ggml/src/ggml-cuda/expert-cache.cu (all code changes), /tmp/ec3-exp/run{A,B,C,D}.err + analyze.py (evidence), branch v3-expert-cache, launcher /home/user/llama.cpp/start-glm51-ec3.sh.
+---
+
+## EXECUTION RESULTS (2026-06-11, post-roadmap)
+
+All top-ranked items implemented/probed and measured (r=3 where it matters):
+
+| Item | Outcome |
+|---|---|
+| 1. Pool rebalance | DONE — full budget allocated, down-pool unstarved (was avail/4 + 25% stranded). Per-pool hits: gate/up 75.6% vs down 73.4% (asymmetry was small). Kept. |
+| 2. Down-dst handoff (B1) | DONE, PPL-exact, down-collect 63→15µs — **t/s NEUTRAL** (18.77±1.03 vs 18.97±0.79). Falsified the "thread-0 wait = token cost" model. Kept ON. |
+| 3. Throttle 16/32 + role-stripe probes | CLOSED — all within noise; stripe kill-criterion met → per-eid striping shelved. |
+| 4. Fused gate+up+SwiGLU (B3) | DONE — paired pools + fusion-args kernel + GLU hook with learned per-layer safety. GLM fuses all 75 layers; PPL clean (5.0077 vs 5.0698). **19.22±1.04 vs 18.99±0.99 = neutral-positive.** Kept ON. |
+| 5. Host-q8 (B2) / flag-poll (B4) | DROPPED — premise falsified by item 2's result. |
+| 8. Expert dropping | SKIPPED — quality risk for ≈noise-level gain. |
+
+Net stack: **~19.0–19.2 t/s tg300** (from 17.9 at roadmap time; stock 14.0).
+Server end-to-end 15.5–16.2 t/s.
+
+**Meta-finding:** at ~75% hit rate every per-node latency lever (sync elimination,
+chain shortening, launch reduction) lands neutral — the binding constraint is the
+GPU-pipeline + CPU-miss-work floor, not thread-0 serial time. Raising the hit rate
+is also closed (capacity saturated, admission optimal both directions). Residual
+gap to the ~24 ceiling is structural: irreducible mmv exec bandwidth + 25% miss CPU.
+Honest next frontier (unimplemented): keeping rows on-GPU through swiglu AND down
+for all-hit experts (extends B1+B3 into a full GPU-side layer path), or hardware.
+
+Bug ledger additions: cudaGetDeviceProperties hidden in ggml_backend_dev_type
+(~1.7ms/call — never call per-split); gallocr pointer reuse defeats pointer-keyed
+matching across layers (serial-tag entries); pools shared across roles via shape
+collision (role-gate any pair logic); python str.replace silently no-ops (assert
+match counts in patch scripts).

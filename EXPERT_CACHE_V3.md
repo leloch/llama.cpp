@@ -12,9 +12,12 @@ the CPU computing the rest.
 |---|---|
 | stock `--fit` (best vanilla placement)        | 14.0 |
 | all experts on CPU, no cache (`-ncmoe 99`)    | 12.5 |
-| **EC3 (`-p 64 -n 200`, r=2)**                 | **17.9 ± 1.2 (+28% vs stock)** |
-| EC3, 500-token horizon                        | 17.6 (stable; hit rate still rising at 77%) |
+| **EC3 final stack (tg300, r=3)**              | **19.2 ± 1.0 (+34% vs stock)** |
+| EC3, 500-token horizon                        | stable (hit rate still rising at 77%) |
 | destructive-mask ceiling (GPU rows were free) | ~24 |
+
+`llama-server` end-to-end: **15.5–16.2 t/s sustained** across domain-switching
+prompts (was 14.8–15.0 before the optimization phase).
 
 Real-world `llama-server` (16K ctx, sampling): **~14.8–15.0 t/s sustained**,
 measured across consecutive prompts switching domains (code → cooking →
@@ -46,6 +49,10 @@ Everything else is optional tuning:
 | `LLAMA_EC3_MIN_EXPERT_KB` | 1024 | skip models with experts smaller than this (too little CPU work to amortize dispatch — e.g. 35B-A3B class) |
 | `LLAMA_EC3_DEFER` | on | defer a gate node's sync into the same layer's up node |
 | `LLAMA_EC3_REUSE` | on | reuse the quantized activation between gate and up |
+| `LLAMA_EC3_FUSE` | on | fused gate+up+SwiGLU GPU dispatch (paired pools; engages per layer after the GLU wiring is observed — GLM yes, Qwen3.6 no) |
+| `LLAMA_EC3_REDIRECT` | on | down-projection dst handoff: rows relayed via pinned image to the consumer's stream, no host syncs |
+| `LLAMA_EC3_THROTTLE` | 8 | at-capacity admission: admit 1-in-N misses |
+| `LLAMA_EC3_STRIPE` | off | role-striping probe (disables defer/reuse/fuse) |
 | `LLAMA_EC3_STATS` | off | print hit/timing stats every N hit-bearing nodes |
 | `LLAMA_EC3_DEBUG` | off | trace cache events (value = max events) |
 | `LLAMA_EC3_SELFTEST` | off | model-free numeric self-test + latency micro-bench at startup |

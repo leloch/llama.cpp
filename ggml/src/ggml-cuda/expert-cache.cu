@@ -23,6 +23,7 @@
 #include "common.cuh"
 #include "mmvq.cuh"
 #include "quantize.cuh"
+#include "ggml-backend-impl.h"
 #include "../ggml-backend-expert-cache.h"
 
 #include <cstdio>
@@ -67,6 +68,13 @@ struct ec3_device {
 
     cudaStream_t compute_stream = nullptr;
 
+    // GPU-resident dst handoff machinery. The pinned image and its event are
+    // double-buffered by parity: node N+1's D2H must not overwrite the image
+    // node N's consumer-stream H2D still reads.
+    char    * h_redir = nullptr; size_t h_redir_half = 0;    // pinned image x2
+    cudaEvent_t redir_evt[2] = {};
+    int       redir_par = 0;
+
     // staging for one node's batched dispatch
     int32_t * h_ids = nullptr;  int32_t * d_ids = nullptr;  size_t ids_cap = 0;   // count
     float   * h_act = nullptr;  float   * d_act = nullptr;  size_t act_cap = 0;   // bytes
@@ -100,6 +108,8 @@ struct ec3_device {
     std::unordered_set<uint64_t> ever_seen, ever_inserted;
     // per-phase wall time (thread-0 serial cost), microseconds
     long long t_plan_us = 0, t_disp_us = 0, t_coll_us = 0, n_nodes = 0;
+    long long t_coll_role_us[3] = {}, n_coll_role[3] = {};   // gate/up/down split
+    long long redirect_claims = 0, redirect_misses_up = 0;
 };
 
 struct ec3_job {
@@ -146,12 +156,28 @@ struct ec3_global {
     int          cur_role = -1;   // 0=gate 1=up 2=down -1=other
     bool         defer    = true; // LLAMA_EC3_DEFER=0 to disable gate-defer
     bool         reuse    = true; // LLAMA_EC3_REUSE=0 to disable act-quant reuse
+    bool         stripe   = false; // LLAMA_EC3_STRIPE=1: role-stripe devices (forces defer off)
 
     // gate-defer safety: defer only on layers where the up node was OBSERVED
     // to directly follow the gate node (learned during the first decode token,
     // so exotic graphs / partial GPU placement can never corrupt gate's dst).
     int  learn_gate_blk = -1;
     bool safe_defer_blk[1024] = {};
+
+    // GPU-resident dst handoff: host dst base -> offered GPU copy. Entries are
+    // one-shot: offered before the CPU split, optionally populated by collect,
+    // resolved (claimed or dropped) at the consumer's input-copy site.
+    struct redirect_entry {
+        size_t  nb1 = 0;
+        int64_t n_rows = 0;
+        void *  gpu_ptr = nullptr;
+        int     dev = -1;
+        uint64_t hit_mask = 0;     // rows relayed by collect
+        bool    populated = false; // collect engaged
+        int     par = 0;           // pinned-image parity used by collect
+    };
+    std::unordered_map<const void *, redirect_entry> redirect;
+    bool redirect_on = true;       // LLAMA_EC3_REDIRECT=0 to disable
 
     long long collect_calls = 0;
 };
@@ -286,34 +312,18 @@ static void ec3_start_workers() {
 // simply gets its pool late. No visit order can lock a device out.
 struct ec3_discovery {
     std::unordered_set<uint64_t> seen;
-    struct shape { size_t size; int wtype; };
+    struct shape { size_t size; int wtype; int n_tensors; };
     std::vector<shape> pending[EC3_MAX_DEV];   // shapes seen, pool not yet built
     bool any_repeat = false;
 };
 static ec3_discovery g_disc;
 
 // build one pool for (size, wtype) on device di; caller ensures no duplicate
-static bool ec3_pool_alloc(int di, size_t expert_size, int wtype, int n_shapes_pending) {
+static bool ec3_pool_alloc(int di, size_t expert_size, int wtype, size_t budget) {
     ec3_device & d = g.dev[di];
     if (d.n_pools >= EC3_MAX_POOLS) return false;
 
     ggml_cuda_set_device(di);
-
-    const size_t reserve = g.reserve_mb << 20;
-    size_t free_mem = 0, total_mem = 0;
-    CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
-    size_t avail = free_mem > reserve ? free_mem - reserve : 0;
-    if (g.budget_mb > 0 && (g.budget_mb << 20) < avail) {
-        avail = g.budget_mb << 20;
-    }
-    // leave room for the device's other not-yet-built pools. MoE models have
-    // (at least) two expert shapes — gate/up and down — and discovery order is
-    // not guaranteed, so never let a single pool claim more than half.
-    // LLAMA_EC3_GREEDY_LAST=1: the LAST pending shape takes ALL remaining avail
-    // (the half-divisor otherwise strands ~pool1-sized VRAM beyond the reserve).
-    int pool_div = n_shapes_pending > 2 ? n_shapes_pending : 2;
-    if (g.greedy_last && n_shapes_pending == 1) pool_div = 1;
-    const size_t budget = avail / pool_div;
 
     int ns = (int)(budget / expert_size);
     if (ns < 64) {
@@ -346,6 +356,7 @@ static bool ec3_pool_alloc(int di, size_t expert_size, int wtype, int n_shapes_p
     if (!d.compute_stream) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&d.compute_stream, cudaStreamNonBlocking));
     }
+
     ec3_start_workers();
     return true;
 }
@@ -362,10 +373,20 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
     const char * p = strstr(name, "blk.");
     if (!p || !strstr(name, "_exps")) return -1;
     const int blk = atoi(p + 4);
-    const int di  = blk % g.n_dev;
+
+    int role = -1;
+    if      (strstr(name, "_gate_exps")) role = 0;
+    else if (strstr(name, "_up_exps"))   role = 1;
+    else if (strstr(name, "_down_exps")) role = 2;
+
+    // LLAMA_EC3_STRIPE=1: spread the three roles of a layer across devices so
+    // gate/up traffic does not serialize on one device's stream (probe)
+    const int di = g.stripe ? (blk * 3 + (role < 0 ? 0 : role)) % g.n_dev
+                            : blk % g.n_dev;
 
     const uint64_t kb = ec3_fnv1a(name);
     ec3_device & d = g.dev[di];
+    const bool first_sight = g_disc.seen.count(kb) == 0;
 
     // shape discovery + on-demand pool construction (see ec3_discovery)
     int pi = -1;
@@ -373,15 +394,17 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
         if (d.pools[i].expert_size == expert_size && d.pools[i].wtype == wtype) { pi = i; break; }
     }
     if (pi < 0) {
-        bool pending = false;
+        ec3_discovery::shape * shp = nullptr;
         for (auto & sh : g_disc.pending[di]) {
-            if (sh.size == expert_size && sh.wtype == wtype) { pending = true; break; }
+            if (sh.size == expert_size && sh.wtype == wtype) { shp = &sh; break; }
         }
-        if (!pending) {
-            g_disc.pending[di].push_back({expert_size, wtype});
+        if (!shp) {
+            g_disc.pending[di].push_back({expert_size, wtype, 0});
+            shp = &g_disc.pending[di].back();
             EC3_DBG("[ec3-dbg] new shape %s blk=%d dev=%d size=%zu type=%d\n",
                     name, blk, di, expert_size, wtype);
         }
+        if (first_sight) shp->n_tensors++;   // distinct tensors using this shape
         if (!g_disc.any_repeat) {
             if (g_disc.seen.count(kb)) {
                 g_disc.any_repeat = true;
@@ -391,10 +414,30 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
                 return -1;
             }
         }
-        // steady state reached: build this device's pending pools now
+        // steady state reached: build this device's pending pools in ONE
+        // proportional pass. Budgets are weighted by referenced bytes per
+        // token (shape size x number of tensors using the shape — gate+up
+        // share a shape, so theirs weighs ~2x per layer vs down's 1x); the
+        // previous sequential-halving scheme left ~25% of the budget
+        // unallocated and starved the down pool (measured).
         auto & pend = g_disc.pending[di];
-        for (size_t i = 0; i < pend.size(); i++) {
-            ec3_pool_alloc(di, pend[i].size, pend[i].wtype, (int)(pend.size() - i));
+        if (!pend.empty()) {
+            const size_t reserve = g.reserve_mb << 20;
+            size_t free_mem = 0, total_mem = 0;
+            ggml_cuda_set_device(di);
+            CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
+            size_t avail = free_mem > reserve ? free_mem - reserve : 0;
+            if (g.budget_mb > 0 && (g.budget_mb << 20) < avail) {
+                avail = g.budget_mb << 20;
+            }
+            double total_w = 0.0;
+            for (auto & sh : pend) {
+                total_w += (double)sh.size * (sh.n_tensors > 0 ? sh.n_tensors : 1);
+            }
+            for (auto & sh : pend) {
+                const double w = (double)sh.size * (sh.n_tensors > 0 ? sh.n_tensors : 1);
+                ec3_pool_alloc(di, sh.size, sh.wtype, (size_t)(avail * (w / total_w)));
+            }
         }
         pend.clear();
         for (int i = 0; i < d.n_pools; i++) {
@@ -410,11 +453,6 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
             return -1;
         }
     }
-
-    int role = -1;
-    if      (strstr(name, "_gate_exps")) role = 0;
-    else if (strstr(name, "_up_exps"))   role = 1;
-    else if (strstr(name, "_down_exps")) role = 2;
 
     // gate-defer safety learning: mark a layer safe when its up node is the
     // very next cache visit after its gate node
@@ -435,6 +473,19 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
     g.cur_n_expert    = n_expert;
     g.cur_pool        = pi;
     return di;
+}
+
+// scatter kernel for the GPU-resident dst handoff: copy row r of src
+// (contiguous n_out floats per row) into dst at row_idx[r]*nb1 bytes
+static __global__ void ec3_scatter_rows(const float * __restrict__ src,
+                                        char * __restrict__ dst,
+                                        const int32_t * __restrict__ row_idx,
+                                        int64_t n_out, size_t nb1, int n_rows) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)n_rows * n_out) return;
+    const int     r = (int)(i / n_out);
+    const int64_t c = i % n_out;
+    ((float *)(dst + (size_t)row_idx[r] * nb1))[c] = src[(size_t)r * n_out + c];
 }
 
 // flush a deferred gate collect: sync the stream, scatter the pending rows
@@ -726,6 +777,66 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
     }
 
     ggml_cuda_set_device(di);
+
+    // ---- GPU-resident dst handoff (down nodes) ----
+    // If the scheduler offered the consumer's GPU copy of this dst, scatter the
+    // hit rows straight into it (peer write, async) and skip the D2H + host
+    // scatter + thread-0 sync entirely. CPU miss rows are uploaded later in
+    // redirect_finalize (after the node barrier, when they are complete).
+    if (g.redirect_on && g.cur_role == 2 && n_hits > 0 && d.pending_rows == 0 && n_hits <= 64) {
+        ec3_global::redirect_entry * re = nullptr;
+        const void * base = nullptr;
+        for (auto & kv : g.redirect) {
+            const char * b = (const char *)kv.first;
+            if ((const char *)dst_rows[0] >= b &&
+                (const char *)dst_rows[0] <  b + (size_t)kv.second.n_rows * kv.second.nb1) {
+                re = &kv.second;
+                base = kv.first;
+                break;
+            }
+        }
+        if (re && re->n_rows <= 64) {
+            // P2P-free relay: async-D2H each hit row into a pinned full-tensor
+            // image at its TARGET row offset, record an event. No host sync.
+            // redirect_finalize fills the miss rows into the same image and
+            // issues one H2D on the consumer's stream, ordered by the event.
+            const size_t img_cap = 64 * re->nb1;
+            if (d.h_redir_half < img_cap) {
+                if (d.h_redir) cudaFreeHost(d.h_redir);
+                CUDA_CHECK(cudaMallocHost((void **)&d.h_redir, 2 * img_cap));
+                d.h_redir_half = img_cap;
+            }
+            d.redir_par ^= 1;
+            const int par = d.redir_par;
+            char * img = d.h_redir + (size_t)par * d.h_redir_half;
+            if (!d.redir_evt[par]) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&d.redir_evt[par], cudaEventDisableTiming));
+            }
+            uint64_t mask = 0;
+            for (int i = 0; i < n_hits; i++) {
+                const int ridx = (int)(((const char *)dst_rows[i] - (const char *)base) / re->nb1);
+                mask |= 1ull << ridx;
+                CUDA_CHECK(cudaMemcpyAsync(img + (size_t)ridx * re->nb1,
+                                           d.d_out + (size_t)i * n_out,
+                                           n_out * sizeof(float),
+                                           cudaMemcpyDeviceToHost, d.compute_stream));
+            }
+            CUDA_CHECK(cudaEventRecord(d.redir_evt[par], d.compute_stream));
+            re->hit_mask  = mask;
+            re->populated = true;
+            re->dev       = di;
+            re->par       = par;
+            d.out_rows = 0;
+            d.t_coll_us += ggml_time_us() - t0;
+            if (g.cur_role >= 0 && g.cur_role < 3) {
+                d.t_coll_role_us[g.cur_role] += ggml_time_us() - t0;
+                d.n_coll_role[g.cur_role]++;
+            }
+            if (g.stats_every > 0 && ++g.collect_calls % g.stats_every == 0) ec3_stats();
+            return;
+        }
+    }
+
     EC3_DBG("[ec3-dbg] collect dev=%d rows=%d pre-sync\n", di, d.out_rows);
     const size_t bytes = (size_t)d.out_rows * n_out * sizeof(float);
     CUDA_CHECK(cudaMemcpyAsync(d.h_out, d.d_out, bytes, cudaMemcpyDeviceToHost, d.compute_stream));
@@ -751,11 +862,61 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
     d.pending_active = false;
     d.pending_rows   = 0;
     d.q8_act_ptr     = nullptr;
-    d.t_coll_us += ggml_time_us() - t0;
+    const int64_t dt = ggml_time_us() - t0;
+    d.t_coll_us += dt;
+    if (g.cur_role >= 0 && g.cur_role < 3) {
+        d.t_coll_role_us[g.cur_role] += dt;
+        d.n_coll_role[g.cur_role]++;
+    }
 
     if (g.stats_every > 0 && ++g.collect_calls % g.stats_every == 0) {
         ec3_stats();
     }
+}
+
+// ---- API: GPU-resident dst handoff ----------------------------------------------------
+
+static void ec3_redirect_offer(const void * host_dst_data, size_t nb1, int64_t n_rows,
+                               void * gpu_copy_data, void * consumer_backend) {
+    GGML_UNUSED(consumer_backend);
+    if (!g.redirect_on || n_rows > 64) return;
+    ec3_global::redirect_entry re;
+    re.nb1     = nb1;
+    re.n_rows  = n_rows;
+    re.gpu_ptr = gpu_copy_data;
+    g.redirect[host_dst_data] = re;
+}
+
+static int ec3_redirect_finalize(const void * host_dst_data, void * consumer_backend) {
+    auto it = g.redirect.find(host_dst_data);
+    if (it == g.redirect.end()) return 0;
+    ec3_global::redirect_entry re = it->second;
+    g.redirect.erase(it);
+    if (!re.populated || re.dev < 0) return 0;
+
+    ec3_device & d = g.dev[re.dev];
+    char * img = d.h_redir + (size_t)re.par * d.h_redir_half;
+
+    // fill the miss rows into the pinned image (the node barrier has passed:
+    // the CPU-computed rows are complete in host dst memory)
+    for (int r = 0; r < (int)re.n_rows; r++) {
+        if (re.hit_mask & (1ull << r)) continue;
+        memcpy(img + (size_t)r * re.nb1,
+               (const char *)host_dst_data + (size_t)r * re.nb1, re.nb1);
+        d.redirect_misses_up++;
+    }
+
+    // one H2D of the full image on the CONSUMER's own stream, ordered behind
+    // the hit-row D2H copies via the event. No host sync anywhere, no P2P.
+    ggml_backend_t be = (ggml_backend_t)consumer_backend;
+    ggml_backend_cuda_context * cc = (ggml_backend_cuda_context *)be->context;
+    ggml_cuda_set_device(cc->device);
+    CUDA_CHECK(cudaStreamWaitEvent(cc->stream(), d.redir_evt[re.par], 0));
+    CUDA_CHECK(cudaMemcpyAsync(re.gpu_ptr, img, (size_t)re.n_rows * re.nb1,
+                               cudaMemcpyHostToDevice, cc->stream()));
+
+    d.redirect_claims++;
+    return 1;
 }
 
 // ---- API: stats ----------------------------------------------------------------------
@@ -787,6 +948,12 @@ static void ec3_stats(void) {
                     (double)d.t_plan_us / d.n_nodes, (double)d.t_disp_us / d.n_nodes,
                     (double)d.t_coll_us / d.n_nodes,
                     (double)(d.t_plan_us + d.t_disp_us + d.t_coll_us) / d.n_nodes);
+            EC3_LOG("[ec3] dev=%d redirect: claims=%lld miss-rows-up=%lld\n",
+                    i, d.redirect_claims, d.redirect_misses_up);
+            EC3_LOG("[ec3] dev=%d coll-by-role: gate=%.1fus(n=%lld) up=%.1fus(n=%lld) down=%.1fus(n=%lld)\n", i,
+                    d.n_coll_role[0] ? (double)d.t_coll_role_us[0]/d.n_coll_role[0] : 0.0, d.n_coll_role[0],
+                    d.n_coll_role[1] ? (double)d.t_coll_role_us[1]/d.n_coll_role[1] : 0.0, d.n_coll_role[1],
+                    d.n_coll_role[2] ? (double)d.t_coll_role_us[2]/d.n_coll_role[2] : 0.0, d.n_coll_role[2]);
         }
     }
 }
@@ -922,12 +1089,24 @@ void ggml_expert_cache_v3_register(void) {
     if (const char * e = getenv("LLAMA_EC3_RESERVE_MB"))    g.reserve_mb = (size_t)atoll(e);
     if (const char * e = getenv("LLAMA_EC3_DEFER"))         g.defer = atoi(e) > 0;
     if (const char * e = getenv("LLAMA_EC3_REUSE"))         g.reuse = atoi(e) > 0;
+    if (const char * e = getenv("LLAMA_EC3_STRIPE"))        g.stripe = atoi(e) > 0;
+    if (g.stripe) {
+        // gate and up land on different devices: the defer absorb would dangle
+        // past the swiglu read (corruption), and the act-quant reuse state is
+        // per-device — both must be off in striped mode
+        g.defer = false;
+        g.reuse = false;
+        EC3_LOG("[ec3] stripe mode: defer/reuse disabled\n");
+    }
 
     ggml_expert_cache_v3.begin    = ec3_begin;
     ggml_expert_cache_v3.plan     = ec3_plan;
     ggml_expert_cache_v3.dispatch = ec3_dispatch;
     ggml_expert_cache_v3.collect  = ec3_collect;
     ggml_expert_cache_v3.stats    = ec3_stats;
+    ggml_expert_cache_v3.redirect_offer    = ec3_redirect_offer;
+    ggml_expert_cache_v3.redirect_finalize = ec3_redirect_finalize;
+    if (const char * e = getenv("LLAMA_EC3_REDIRECT")) g.redirect_on = atoi(e) > 0;
 
     EC3_LOG("[ec3] enabled: n_dev=%d budget=%s inserts/plan=%d workers=%d stats_every=%d\n",
             g.n_dev, g.budget_mb ? "env" : "auto-70%-free", g.inserts_per_plan,

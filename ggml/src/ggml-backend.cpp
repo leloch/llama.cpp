@@ -1682,6 +1682,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                     copy_experts(first_id, last_id);
                 } else {
+                    // expert-cache v3 dst handoff: if the cache populated this
+                    // input's GPU copy directly (down-projection rows), skip the
+                    // round-trip copy AND the blocking sync — the cache installed
+                    // a stream-order dependency on this backend instead.
+                    if (ggml_expert_cache_v3.redirect_finalize &&
+                        ggml_expert_cache_v3.redirect_finalize(input->data, split_backend)) {
+                        continue;
+                    }
+
+                    // expert-cache v3 probe: measure the blocking-fallback input
+                    // copies (CPU MoE dst -> GPU) that EC3's GPU-resident handoff
+                    // would eliminate. LLAMA_EC3_SCHEDPROBE=1.
+                    static int ec3_schedprobe = -1;
+                    if (ec3_schedprobe < 0) {
+                        const char * e = getenv("LLAMA_EC3_SCHEDPROBE");
+                        ec3_schedprobe = e ? atoi(e) : 0;
+                    }
+                    const bool probe_this = ec3_schedprobe > 0 && strstr(input->name, "ffn_moe") != NULL;
+                    int64_t pt0 = probe_this ? ggml_time_us() : 0;
+
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
@@ -1692,6 +1712,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             ggml_backend_synchronize(split_backend);
                         }
                         ggml_backend_tensor_copy(input, input_cpy);
+                    }
+
+                    if (probe_this) {
+                        static int64_t probe_us = 0, probe_n = 0;
+                        probe_us += ggml_time_us() - pt0;
+                        if (++probe_n % 2000 == 0) {
+                            fprintf(stderr, "[ec3-schedprobe] ffn_moe input copies: n=%lld avg=%.1fus total=%.1fms\n",
+                                    (long long)probe_n, (double)probe_us / probe_n, probe_us / 1000.0);
+                        }
                     }
                 }
             }

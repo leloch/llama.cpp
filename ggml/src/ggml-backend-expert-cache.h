@@ -51,6 +51,20 @@ struct ggml_expert_cache_v3_api {
 
     // Periodic stats logging (rate-limited internally).
     void (*stats)(void);
+
+    // ---- GPU-resident dst handoff (down-projection round-trip elimination) ----
+    // The scheduler offers the GPU-side copy tensor of a CPU MUL_MAT_ID dst
+    // BEFORE the CPU split runs. If the cache then computes that node, it
+    // scatters its GPU rows directly into gpu_copy_data (async) instead of
+    // pulling them to the host.
+    void (*redirect_offer)(const void * host_dst_data, size_t nb1, int64_t n_rows,
+                           void * gpu_copy_data, void * consumer_backend);
+    // Called by the scheduler at the consumer split's input-copy site, after
+    // the CPU split completed. Returns 1 if the cache fully populated the GPU
+    // copy (it uploads the CPU-computed miss rows here and installs a
+    // stream-order dependency on the consumer backend) — the scheduler must
+    // then SKIP its own copy. Returns 0 for the normal copy path.
+    int (*redirect_finalize)(const void * host_dst_data, void * consumer_backend);
 };
 
 // Zero-initialized in ggml-backend.cpp; populated by the CUDA backend in

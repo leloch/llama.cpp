@@ -18,8 +18,14 @@ Build: branch v3-expert-cache @ 83918dbee+. "Vanilla" = same binary, LLAMA_EC3=0
 | Qwen3.6-35B-A3B Q4_K_XL | qwen35moe | 21G | 4 GPU | 148 | 146 | dormant |
 | Qwen3-30B-A3B Q4_K_XL | qwen3moe | 17G | 4 GPU | 204.5 | 205.2 | dormant |
 | ERNIE-4.5-21B-A3B Q4_K_M | ernie4_5-moe | 12G | 4 GPU | 228.3 | 219.4 | dormant |
+| gpt-oss-120b F16 | gpt-oss | 61G | 4 GPU | 121.8 | 121.8 | dormant |
+| Llama-4-Scout Q4_K_XL | llama4 | 58G | 4 GPU | 58.33 | 58.32 | dormant |
 
-## Forced CPU-offload regime (`-ngl 99 -ncmoe 99`, same placement both arms)
+## Cache contribution WITHIN the offload regime
+(`-ngl 99 -ncmoe 99` both arms, cache on vs off — isolates the cache mechanism;
+NOT a vs-best-vanilla claim. The vs-best-vanilla numbers are the Auto section
+above and the 4-arm forced-spill table below, where vanilla autofit's static
+placement is an explicit arm.)
 
 | Model | EC3 | Vanilla | Delta | temp-0 identity |
 |---|---|---|---|---|
@@ -32,6 +38,7 @@ Build: branch v3-expert-cache @ 83918dbee+. "Vanilla" = same binary, LLAMA_EC3=0
 | gpt-oss-120b MXFP4/F16 | **60.7** | 44.1 | **+37.8%** | IDENTICAL (fuse refused on SWIGLU_OAI) |
 | gpt-oss-20b | **88.3** | 65.3 | **+35.3%** | IDENTICAL |
 | OLMoE-7B-A1B Q3_K_M | **231.4** | 204.2 | **+13.3%** | IDENTICAL (tiny-expert extreme) |
+| Llama-4-Scout 109B Q4_K_XL | **37.1** | 25.8 | **+43.6%** | IDENTICAL (top-1 routing, 28MB experts) |
 
 *vanilla figure = best stock config (fitt), stricter than same-placement.
 

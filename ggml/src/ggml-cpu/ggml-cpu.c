@@ -1628,15 +1628,17 @@ static void ggml_compute_forward_mul_mat_id(
         // computes the remaining rows; results land in dst in the collect step
         // at the end of this function, before the node completes.
         if (ggml_expert_cache_v3.begin && src1->type == GGML_TYPE_F32 &&
-            ids->ne[1] == 1 && n_ids <= EC3_MAX_TOPK) {
+            n_ids * ids->ne[1] <= EC3_MAX_TOPK) {
             ec3_dev = ggml_expert_cache_v3.begin(src0->name, src0->data, nb02,
                                                  ne00, ne01, (int) type, ne02, ids->ne[1]);
             if (ec3_dev >= 0) {
                 int32_t ec3_ids[EC3_MAX_TOPK];
-                for (int id = 0; id < n_ids; ++id) {
-                    ec3_ids[id] = *(const int32_t *) ((const char *) ids->data + id*ids->nb[0]);
+                for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                    for (int id = 0; id < n_ids; ++id) {
+                        ec3_ids[iid1*n_ids + id] = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                    }
                 }
-                ggml_expert_cache_v3.plan(ec3_dev, ec3_ids, n_ids, ec3_slot_idx);
+                ggml_expert_cache_v3.plan(ec3_dev, ec3_ids, (int)(n_ids * ids->ne[1]), ec3_slot_idx);
             }
         }
 
@@ -1657,10 +1659,10 @@ static void ggml_compute_forward_mul_mat_id(
 
                 assert(i02 < n_as);
 
-                if (ec3_dev >= 0 && ec3_slot_idx[id] >= 0) {
+                if (ec3_dev >= 0 && ec3_slot_idx[iid1*n_ids + id] >= 0) {
                     // GPU computes this row from the expert cache
                     const int64_t i11 = id % ne11;
-                    ec3_compact[ec3_n_hits] = ec3_slot_idx[id];
+                    ec3_compact[ec3_n_hits] = ec3_slot_idx[iid1*n_ids + id];
                     ec3_acts[ec3_n_hits]    = (const float *) ((const char *) src1->data + i11*nb11 + iid1*nb12);
                     ec3_rows[ec3_n_hits]    = (float *) ((char *) dst->data + iid1*nb2 + id*nb1);
                     ec3_n_hits++;

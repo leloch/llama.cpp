@@ -156,6 +156,8 @@ struct ec3_global {
     size_t min_expert_bytes = 1u << 20; // skip models whose experts are too small
                                         // to amortize per-node dispatch (measured:
                                         // 0.45MB experts lose, 3MB+ win big)
+    int    max_batch        = 1; // decode batches up to this size use the cache
+                                 // (LLAMA_EC3_MAX_BATCH; >1 for spec-verify/parallel)
     int    stats_every      = 0; // log every N collect() calls (0 = off)
 
     ec3_device dev[EC3_MAX_DEV];
@@ -174,6 +176,7 @@ struct ec3_global {
     int          cur_pool = -1;
     int          cur_blk  = -1;
     int          cur_role = -1;   // 0=gate 1=up 2=down -1=other
+    int64_t      cur_n_tokens = 1;
     int32_t      cur_slot_idx[64] = {};
     int          cur_n_ids = 0;
     std::unordered_map<const void *, int> glu_learn;  // gate MMID dst base -> blk
@@ -430,7 +433,7 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
                      int64_t n_in, int64_t n_out, int wtype, int64_t n_expert, int64_t n_tokens) {
     GGML_UNUSED(n_in); GGML_UNUSED(n_out);
 
-    if (!g.enabled || n_tokens != 1) return -1;
+    if (!g.enabled || n_tokens < 1 || n_tokens > g.max_batch) return -1;
     if (expert_size < g.min_expert_bytes) return -1;
 
     const char * p = strstr(name, "blk.");
@@ -542,6 +545,7 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
     g.cur_host_base   = host_base;
     g.cur_expert_size = expert_size;
     g.cur_n_expert    = n_expert;
+    g.cur_n_tokens    = n_tokens;
     g.cur_pool        = pi;
     return di;
 }
@@ -717,7 +721,7 @@ static void ec3_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_out, int
     ec3_pool   & p = d.pools[g.cur_pool];
 
     const bool blk_ok     = g.cur_blk >= 0 && g.cur_blk < 1024;
-    const bool fuse_layer = p.paired && blk_ok && g.safe_fuse_blk[g.cur_blk];
+    const bool fuse_layer = g.cur_n_tokens == 1 && p.paired && blk_ok && g.safe_fuse_blk[g.cur_blk];
     if (fuse_layer && g.cur_role == 1) {
         // fused rows were computed at the gate node; nothing to launch here
         d.t_disp_us += ggml_time_us() - t0;
@@ -854,7 +858,7 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
 
     // fused-GLU learning must happen before any early return: record this
     // node's dst base so the GLU hook can prove the pair wiring per layer
-    if (g.cur_pool >= 0 && d.pools[g.cur_pool].paired && n_hits > 0 &&
+    if (g.cur_n_tokens == 1 && g.cur_pool >= 0 && d.pools[g.cur_pool].paired && n_hits > 0 &&
         g.cur_blk >= 0 && g.cur_blk < 1024 && (g.cur_role == 0 || g.cur_role == 1)) {
         int k0l = -1;
         for (int k = 0; k < g.cur_n_ids; k++) {
@@ -874,7 +878,7 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
 
     // gate-defer: postpone this sync into the same layer's up node (only on
     // layers where up was observed to directly follow gate — see begin())
-    if (g.defer && g.cur_role == 0 && !d.pending_active && n_hits <= 64 &&
+    if (g.defer && g.cur_n_tokens == 1 && g.cur_role == 0 && !d.pending_active && n_hits <= 64 &&
         g.cur_blk >= 0 && g.cur_blk < 1024 && g.safe_defer_blk[g.cur_blk] &&
         !(g.fuse && g.cur_pool >= 0 && d.pools[g.cur_pool].paired && g.safe_fuse_blk[g.cur_blk])) {
         d.pending_active = true;
@@ -907,7 +911,7 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
     ggml_cuda_set_device(di);
 
     // ---- fused gate+up+GLU path (paired pools) ----
-    if (g.cur_pool >= 0 && d.pools[g.cur_pool].paired && n_hits > 0 &&
+    if (g.cur_n_tokens == 1 && g.cur_pool >= 0 && d.pools[g.cur_pool].paired && n_hits > 0 &&
         g.cur_blk >= 0 && g.cur_blk < 1024 && (g.cur_role == 0 || g.cur_role == 1)) {
         // reconstruct this node's dst base from the first hit's ids position
         int k0 = -1;
@@ -962,7 +966,7 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
     // hit rows straight into it (peer write, async) and skip the D2H + host
     // scatter + thread-0 sync entirely. CPU miss rows are uploaded later in
     // redirect_finalize (after the node barrier, when they are complete).
-    if (g.redirect_on && g.cur_role == 2 && n_hits > 0 && d.pending_rows == 0 && n_hits <= 64) {
+    if (g.redirect_on && g.cur_n_tokens == 1 && g.cur_role == 2 && n_hits > 0 && d.pending_rows == 0 && n_hits <= 64) {
         ec3_global::redirect_entry * re = nullptr;
         const void * base = nullptr;
         for (auto & kv : g.redirect) {
@@ -1316,6 +1320,7 @@ void ggml_expert_cache_v3_register(void) {
     if (const char * e = getenv("LLAMA_EC3_REUSE"))         g.reuse = atoi(e) > 0;
     if (const char * e = getenv("LLAMA_EC3_STRIPE"))        g.stripe = atoi(e) > 0;
     if (const char * e = getenv("LLAMA_EC3_FUSE"))          g.fuse = atoi(e) > 0;
+    if (const char * e = getenv("LLAMA_EC3_MAX_BATCH"))     { int n = atoi(e); if (n >= 1 && n <= 8) g.max_batch = n; }
     if (g.stripe && g.fuse) {
         g.fuse = false;  // pair state is per-device; striping splits roles across devices
         EC3_LOG("[ec3] stripe mode: fuse disabled\n");

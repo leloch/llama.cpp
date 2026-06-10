@@ -68,6 +68,7 @@ struct ec3_pool {
 struct ec3_device {
     ec3_pool pools[EC3_MAX_POOLS];
     int      n_pools = 0;
+    bool     dead    = false;   // CUDA failure or trim: cache permanently off here
 
     cudaStream_t compute_stream = nullptr;
 
@@ -244,6 +245,20 @@ static long long g_dbg_n = 0;
         if (g_dbg < 0) { const char * _e = getenv("LLAMA_EC3_DEBUG"); g_dbg = _e ? atoi(_e) : 0; } \
         if (g_dbg > 0 && g_dbg_n++ < (g_dbg >= 10 ? (long long)g_dbg : 400)) { EC3_LOG(__VA_ARGS__); fflush(stderr); } \
     } while (0)
+
+// checked CUDA call: on failure the device's cache is disabled (begin() will
+// refuse) and the caller takes its degraded-but-finite path — a transient CUDA
+// error must never abort the host process (the stock CPU path still works)
+static bool ec3_ok(int di, cudaError_t e, const char * what) {
+    if (e == cudaSuccess) return true;
+    cudaGetLastError();
+    if (di >= 0 && di < EC3_MAX_DEV && !g.dev[di].dead) {
+        g.dev[di].dead = true;
+        EC3_LOG("[ec3] dev=%d DISABLED: %s failed: %s (CPU path takes over)\n",
+                di, what, cudaGetErrorString(e));
+    }
+    return false;
+}
 
 static uint64_t ec3_fnv1a(const char * s) {
     uint64_t h = 0xcbf29ce484222325ULL;
@@ -535,6 +550,7 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
 
     const uint64_t kb = ec3_fnv1a(name);
     ec3_device & d = g.dev[di];
+    if (d.dead) return -1;
     const bool first_sight = g_disc.seen.count(kb) == 0;
 
     // shape discovery + on-demand pool construction (see ec3_discovery)
@@ -682,10 +698,12 @@ static void ec3_flush(int di) {
     if (!d.pending_active) return;
     ggml_cuda_set_device(di);
     const size_t bytes = (size_t)d.out_rows * d.pending_n_out * sizeof(float);
-    CUDA_CHECK(cudaMemcpyAsync(d.h_out, d.d_out, bytes, cudaMemcpyDeviceToHost, d.compute_stream));
-    CUDA_CHECK(cudaStreamSynchronize(d.compute_stream));
+    const bool fok = !d.dead
+        && ec3_ok(di, cudaMemcpyAsync(d.h_out, d.d_out, bytes, cudaMemcpyDeviceToHost, d.compute_stream), "flush D2H")
+        && ec3_ok(di, cudaStreamSynchronize(d.compute_stream), "flush sync");
     for (int i = 0; i < d.pending_rows; i++) {
-        memcpy(d.pending_dst[i], d.h_out + (size_t)i * d.pending_n_out, d.pending_n_out * sizeof(float));
+        if (fok) memcpy(d.pending_dst[i], d.h_out + (size_t)i * d.pending_n_out, d.pending_n_out * sizeof(float));
+        else     memset(d.pending_dst[i], 0, d.pending_n_out * sizeof(float));
     }
     d.pending_active = false;
     d.pending_rows   = 0;
@@ -884,8 +902,12 @@ static void ec3_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_out, int
         const size_t cap = n_hits * 2 + 8;
         if (d.h_ids) cudaFreeHost(d.h_ids);
         if (d.d_ids) cudaFree(d.d_ids);
-        CUDA_CHECK(cudaMallocHost((void **)&d.h_ids, 2 * cap * sizeof(int32_t)));
-        CUDA_CHECK(cudaMalloc((void **)&d.d_ids, 2 * cap * sizeof(int32_t)));
+        d.h_ids = nullptr; d.d_ids = nullptr;
+        if (!ec3_ok(di, cudaMallocHost((void **)&d.h_ids, 2 * cap * sizeof(int32_t)), "ids host alloc") ||
+            !ec3_ok(di, cudaMalloc((void **)&d.d_ids, 2 * cap * sizeof(int32_t)), "ids dev alloc")) {
+            d.out_rows += n_hits;
+            return;
+        }
         d.ids_cap = cap;
     }
     const size_t need_act = (size_t)act_n * n_in * sizeof(float);
@@ -893,8 +915,12 @@ static void ec3_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_out, int
         const size_t cap = need_act * 2;
         if (d.h_act) cudaFreeHost(d.h_act);
         if (d.d_act) cudaFree(d.d_act);
-        CUDA_CHECK(cudaMallocHost((void **)&d.h_act, 2 * cap));
-        CUDA_CHECK(cudaMalloc((void **)&d.d_act, 2 * cap));
+        d.h_act = nullptr; d.d_act = nullptr;
+        if (!ec3_ok(di, cudaMallocHost((void **)&d.h_act, 2 * cap), "act host alloc") ||
+            !ec3_ok(di, cudaMalloc((void **)&d.d_act, 2 * cap), "act dev alloc")) {
+            d.out_rows += n_hits;
+            return;
+        }
         d.act_cap = cap;
     }
     const int       half    = d.pending_active ? 1 : 0;
@@ -906,7 +932,11 @@ static void ec3_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_out, int
     if (d.act_q8_cap < need_q8) {
         const size_t cap = need_q8 * 2;
         if (d.d_act_q8) cudaFree(d.d_act_q8);
-        CUDA_CHECK(cudaMalloc(&d.d_act_q8, 2 * cap));
+        d.d_act_q8 = nullptr;
+        if (!ec3_ok(di, cudaMalloc(&d.d_act_q8, 2 * cap), "q8 alloc")) {
+            d.out_rows += n_hits;
+            return;
+        }
         d.act_q8_cap  = cap;
         d.act_q8_half = cap;
     }
@@ -916,13 +946,21 @@ static void ec3_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_out, int
         if (d.pending_active) ec3_flush(di);
         const size_t cap = ((size_t)(d.out_rows + n_hits) * n_out * sizeof(float)) * 2 + 65536;
         if (d.d_out) cudaFree(d.d_out);
-        CUDA_CHECK(cudaMalloc((void **)&d.d_out, cap));
+        d.d_out = nullptr;
+        if (!ec3_ok(di, cudaMalloc((void **)&d.d_out, cap), "out dev alloc")) {
+            d.out_rows += n_hits;
+            return;
+        }
         d.d_out_cap = cap;
     }
     if (d.h_out_cap < need_out) {
         const size_t cap = need_out * 2 + 65536;
         if (d.h_out) cudaFreeHost(d.h_out);
-        CUDA_CHECK(cudaMallocHost((void **)&d.h_out, cap));
+        d.h_out = nullptr;
+        if (!ec3_ok(di, cudaMallocHost((void **)&d.h_out, cap), "out host alloc")) {
+            d.out_rows += n_hits;
+            return;
+        }
         d.h_out_cap = cap;
     }
 
@@ -947,9 +985,9 @@ static void ec3_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_out, int
     // captured once into a CUDA graph and replayed as a single launch — the
     // chain's per-op launch latency is the dominant per-node cost.
     auto emit_chain = [&](cudaStream_t s) {
-        CUDA_CHECK(cudaMemcpyAsync(d_ids_h, h_ids_h, n_hits * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+        if (!ec3_ok(di, cudaMemcpyAsync(d_ids_h, h_ids_h, n_hits * sizeof(int32_t), cudaMemcpyHostToDevice, s), "ids H2D")) return;
         if (!reuse_q8) {
-            CUDA_CHECK(cudaMemcpyAsync(d_act_h, h_act_h, need_act, cudaMemcpyHostToDevice, s));
+            if (!ec3_ok(di, cudaMemcpyAsync(d_act_h, h_act_h, need_act, cudaMemcpyHostToDevice, s), "act H2D")) return;
             quantize_row_q8_1_cuda(d_act_h, /*ids=*/nullptr, (void *)act_q8, wtype,
                                    n_in, /*s01=*/n_in, /*s02=*/(int64_t)act_n * n_in, /*s03=*/(int64_t)act_n * n_in,
                                    n_in_padded, /*ne1=*/act_n, /*ne2=*/1, /*ne3=*/1, s);
@@ -1076,7 +1114,7 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
                     f.mask |= 1ull << k;
                 }
                 const size_t bytes = (size_t)d.out_rows * n_out * sizeof(float);
-                CUDA_CHECK(cudaMemcpyAsync(d.h_out, d.d_out, bytes, cudaMemcpyDeviceToHost, d.compute_stream));
+                ec3_ok(di, cudaMemcpyAsync(d.h_out, d.d_out, bytes, cudaMemcpyDeviceToHost, d.compute_stream), "fused D2H");
                 d.out_rows = 0;
                 d.q8_act_ptr = nullptr;
                 d.fused_layers++;
@@ -1118,29 +1156,37 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
             // redirect_finalize fills the miss rows into the same image and
             // issues one H2D on the consumer's stream, ordered by the event.
             const size_t img_cap = 64 * re->nb1;
+            bool rok = true;
             if (d.h_redir_half < img_cap) {
                 if (d.h_redir) cudaFreeHost(d.h_redir);
-                CUDA_CHECK(cudaMallocHost((void **)&d.h_redir, 2 * img_cap));
-                d.h_redir_half = img_cap;
+                d.h_redir = nullptr;
+                rok = ec3_ok(di, cudaMallocHost((void **)&d.h_redir, 2 * img_cap), "redirect image alloc");
+                d.h_redir_half = rok ? img_cap : 0;
             }
             d.redir_par ^= 1;
             const int par = d.redir_par;
             char * img = d.h_redir + (size_t)par * d.h_redir_half;
-            if (!d.redir_evt[par]) {
-                CUDA_CHECK(cudaEventCreateWithFlags(&d.redir_evt[par], cudaEventDisableTiming));
+            if (rok && !d.redir_evt[par]) {
+                rok = ec3_ok(di, cudaEventCreateWithFlags(&d.redir_evt[par], cudaEventDisableTiming), "redirect event create");
             }
             uint64_t mask = 0;
-            for (int i = 0; i < n_hits; i++) {
+            for (int i = 0; rok && i < n_hits; i++) {
                 const int ridx = (int)(((const char *)dst_rows[i] - (const char *)base) / re->nb1);
                 mask |= 1ull << ridx;
-                CUDA_CHECK(cudaMemcpyAsync(img + (size_t)ridx * re->nb1,
+                rok = ec3_ok(di, cudaMemcpyAsync(img + (size_t)ridx * re->nb1,
                                            d.d_out + (size_t)i * n_out,
                                            n_out * sizeof(float),
-                                           cudaMemcpyDeviceToHost, d.compute_stream));
+                                           cudaMemcpyDeviceToHost, d.compute_stream), "redirect D2H");
             }
-            CUDA_CHECK(cudaEventRecord(d.redir_evt[par], d.compute_stream));
+            if (rok) {
+                rok = ec3_ok(di, cudaEventRecord(d.redir_evt[par], d.compute_stream), "redirect event record");
+            }
+            if (!rok) {
+                // degraded: ship finite zeros via the scheduler's normal copy
+                for (int i = 0; i < n_hits; i++) memset(dst_rows[i], 0, n_out * sizeof(float));
+            }
             re->hit_mask  = mask;
-            re->populated = true;
+            re->populated = rok;
             re->dev       = di;
             re->par       = par;
             d.out_rows = 0;
@@ -1156,8 +1202,9 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
 
     EC3_DBG("[ec3-dbg] collect dev=%d rows=%d pre-sync\n", di, d.out_rows);
     const size_t bytes = (size_t)d.out_rows * n_out * sizeof(float);
-    CUDA_CHECK(cudaMemcpyAsync(d.h_out, d.d_out, bytes, cudaMemcpyDeviceToHost, d.compute_stream));
-    CUDA_CHECK(cudaStreamSynchronize(d.compute_stream));
+    const bool cok = !d.dead && d.h_out && d.d_out
+        && ec3_ok(di, cudaMemcpyAsync(d.h_out, d.d_out, bytes, cudaMemcpyDeviceToHost, d.compute_stream), "collect D2H")
+        && ec3_ok(di, cudaStreamSynchronize(d.compute_stream), "collect sync");
     EC3_DBG("[ec3-dbg] collect dev=%d post-sync\n", di);
     if (g_dbg > 0 && d.pending_rows > 0) {
         static int violations = 0, checks = 0;
@@ -1170,10 +1217,12 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
         }
     }
     for (int i = 0; i < d.pending_rows; i++) {
-        memcpy(d.pending_dst[i], d.h_out + (size_t)i * n_out, n_out * sizeof(float));
+        if (cok) memcpy(d.pending_dst[i], d.h_out + (size_t)i * n_out, n_out * sizeof(float));
+        else     memset(d.pending_dst[i], 0, n_out * sizeof(float));
     }
     for (int i = 0; i < n_hits; i++) {
-        memcpy(dst_rows[i], d.h_out + (size_t)(d.pending_rows + i) * n_out, n_out * sizeof(float));
+        if (cok) memcpy(dst_rows[i], d.h_out + (size_t)(d.pending_rows + i) * n_out, n_out * sizeof(float));
+        else     memset(dst_rows[i], 0, n_out * sizeof(float));
     }
     d.out_rows       = 0;
     d.pending_active = false;
@@ -1228,9 +1277,11 @@ static int ec3_redirect_finalize(const void * host_dst_data, void * consumer_bac
     ggml_backend_t be = (ggml_backend_t)consumer_backend;
     ggml_backend_cuda_context * cc = (ggml_backend_cuda_context *)be->context;
     ggml_cuda_set_device(cc->device);
-    CUDA_CHECK(cudaStreamWaitEvent(cc->stream(), d.redir_evt[re.par], 0));
-    CUDA_CHECK(cudaMemcpyAsync(re.gpu_ptr, img, (size_t)re.n_rows * re.nb1,
-                               cudaMemcpyHostToDevice, cc->stream()));
+    if (!ec3_ok(re.dev, cudaStreamWaitEvent(cc->stream(), d.redir_evt[re.par], 0), "redirect wait") ||
+        !ec3_ok(re.dev, cudaMemcpyAsync(re.gpu_ptr, img, (size_t)re.n_rows * re.nb1,
+                               cudaMemcpyHostToDevice, cc->stream()), "redirect H2D")) {
+        return 0;   // scheduler performs its normal copy from the host dst
+    }
 
     d.redirect_claims++;
     return 1;
@@ -1270,16 +1321,62 @@ static unsigned long long ec3_glu_hits(const void * src0_data, const void * src1
         if (ith == 0 && !f.scattered) {
             ec3_device & d = g.dev[di];
             ggml_cuda_set_device(di);
-            CUDA_CHECK(cudaStreamSynchronize(d.compute_stream));   // D2H of fused rows
+            const bool gok = !d.dead &&
+                ec3_ok(di, cudaStreamSynchronize(d.compute_stream), "glu sync");   // D2H of fused rows
             for (int i = 0; i < f.n; i++) {
-                memcpy((char *)dst_data + (size_t)f.rows[i] * dst_nb1,
-                       d.h_out + (size_t)i * f.n_out,
-                       f.n_out * sizeof(float));
+                char * row = (char *)dst_data + (size_t)f.rows[i] * dst_nb1;
+                if (gok) memcpy(row, d.h_out + (size_t)i * f.n_out, f.n_out * sizeof(float));
+                else     memset(row, 0, f.n_out * sizeof(float));
             }
             f.scattered = true;
         }
         return f.mask;
     }
+}
+
+// ---- trim: surrender the device's cache VRAM under allocator pressure ------------------
+//
+// Called from the CUDA backend's pool-alloc OOM retry. Frees every slab and
+// scratch buffer on the device and marks its cache dead (conservative: the
+// budget decision was clearly wrong for this workload). Returns bytes freed.
+
+extern "C" size_t ggml_expert_cache_v3_trim(int device) {
+    if (!g.enabled || device < 0 || device >= g.n_dev) return 0;
+    ec3_device & d = g.dev[device];
+    if (d.n_pools == 0 && !d.d_out) return 0;
+
+    std::unique_lock<std::mutex> lk(g.mu);
+    for (auto it = g.queue.begin(); it != g.queue.end(); ) {
+        if (it->dev == device) it = g.queue.erase(it); else ++it;
+    }
+    g.cv_idle.wait(lk, [&]{
+        for (int w = 0; w < 16; w++) if (g.inflight_src[w]) return false;
+        return true;
+    });
+
+    cudaSetDevice(device);
+    size_t freed = 0;
+    for (int i = 0; i < d.n_pools; i++) {
+        ec3_pool & p = d.pools[i];
+        if (p.slab)  { freed += (size_t)p.n_slots * p.expert_size; cudaFree(p.slab);  p.slab  = nullptr; }
+        if (p.slab2) { freed += (size_t)p.n_slots * p.expert_size; cudaFree(p.slab2); p.slab2 = nullptr; }
+        p.map.clear();
+        p.n_slots = 0;
+        p.n_used  = 0;
+    }
+    if (d.d_ids)    { cudaFree(d.d_ids);          d.d_ids = nullptr;    d.ids_cap = 0; }
+    if (d.d_act)    { cudaFree(d.d_act);          d.d_act = nullptr;    d.act_cap = 0; }
+    if (d.d_act_q8) { cudaFree(d.d_act_q8);       d.d_act_q8 = nullptr; d.act_q8_cap = 0; }
+    if (d.d_out)    { freed += d.d_out_cap; cudaFree(d.d_out); d.d_out = nullptr; d.d_out_cap = 0; }
+    cudaGetLastError();
+    d.pending_active = false;
+    d.pending_rows   = 0;
+    d.out_rows       = 0;
+    d.fused.active   = false;
+    d.dead = true;
+    EC3_LOG("[ec3] dev=%d TRIMMED %zu MB under VRAM pressure — cache off on this device\n",
+            device, freed >> 20);
+    return freed;
 }
 
 // ---- API: invalidate (host weight buffer teardown) -------------------------------------

@@ -52,7 +52,9 @@ struct ec3_slot {
 struct ec3_pool {
     size_t expert_size = 0;   // == slot stride == source tensor nb[2]
     int    wtype       = -1;
-    char * slab        = nullptr;
+    char * slab        = nullptr;   // up weights (mmv x operand)
+    char * slab2       = nullptr;   // gate weights (fusion operand), paired pools only
+    bool   paired      = false;     // one entry covers the (gate, up) pair of an expert
     int    n_slots     = 0;
     int    n_used      = 0;
 
@@ -97,6 +99,23 @@ struct ec3_device {
     const float * q8_act_ptr = nullptr;   // host act already quantized on device
     int           q8_act_blk = -1;
 
+    // fused gate+up+GLU: one layer in flight per device. Filled at the gate
+    // node, matched+scattered by the CPU GLU kernel via glu_hits().
+    struct {
+        bool         active = false;
+        const void * gate_dst = nullptr;  // gate MMID dst base (== glu src0)
+        const void * up_dst   = nullptr;  // up MMID dst base   (== glu src1)
+        unsigned long long mask = 0;      // dst row bits computed on GPU
+        int          rows[64];            // dst row index per d_out row
+        int          n = 0;
+        int64_t      n_out = 0;
+        bool         scattered = false;
+        long long    serial = 0;          // gallocr reuses dst pointers every
+                                          // layer: the GLU hook must match the
+                                          // NEWEST entry, not any stale one
+    } fused;
+    long long fused_layers = 0;
+
 
     // stats
     long long hits = 0, misses = 0, inserts = 0, evictions = 0;
@@ -117,7 +136,8 @@ struct ec3_job {
     int        pool;
     uint64_t   key;
     int        slot_idx;
-    const void * src;
+    const void * src;        // up weights (paired) or sole tensor
+    const void * src_gate;   // gate weights (paired pools), else NULL
     size_t     bytes;
 };
 
@@ -154,6 +174,9 @@ struct ec3_global {
     int          cur_pool = -1;
     int          cur_blk  = -1;
     int          cur_role = -1;   // 0=gate 1=up 2=down -1=other
+    int32_t      cur_slot_idx[64] = {};
+    int          cur_n_ids = 0;
+    std::unordered_map<const void *, int> glu_learn;  // gate MMID dst base -> blk
     bool         defer    = true; // LLAMA_EC3_DEFER=0 to disable gate-defer
     bool         reuse    = true; // LLAMA_EC3_REUSE=0 to disable act-quant reuse
     bool         stripe   = false; // LLAMA_EC3_STRIPE=1: role-stripe devices (forces defer off)
@@ -163,6 +186,18 @@ struct ec3_global {
     // so exotic graphs / partial GPU placement can never corrupt gate's dst).
     int  learn_gate_blk = -1;
     bool safe_defer_blk[1024] = {};
+
+    // fused gate+up+GLU path. Pair-fused dispatch engages per layer only after
+    // the CPU GLU hook was OBSERVED matching that layer's gate/up dst pair
+    // (learned on the first decode tokens) — a graph without the hook firing
+    // would otherwise compute silu(garbage)*garbage for the skipped rows.
+    bool fuse = true;                    // LLAMA_EC3_FUSE=0 to disable
+    long long fuse_serial = 0;
+    bool safe_fuse_blk[1024] = {};
+    const void * role_base[2][1024] = {}; // [role][blk] -> tensor host base
+    // last gate/up MMID dst bases per blk (for GLU-hook learning)
+    const void * learn_gate_dst[1024] = {};
+    const void * learn_up_dst[1024] = {};
 
     // GPU-resident dst handoff: host dst base -> offered GPU copy. Entries are
     // one-shot: offered before the CPU split, optionally populated by collect,
@@ -249,6 +284,7 @@ static void ec3_worker_main() {
         cudaSetDevice(job.dev);
         EC3_DBG("[ec3-dbg] worker job dev=%d slot=%d bytes=%zu\n", job.dev, job.slot_idx, job.bytes);
         char * dst = p.slab + (size_t)job.slot_idx * p.expert_size;
+        char * dst_gate = job.src_gate ? p.slab2 + (size_t)job.slot_idx * p.expert_size : nullptr;
 
         cudaError_t err = cudaSuccess;
         if (stage_cap < job.bytes) {
@@ -266,9 +302,19 @@ static void ec3_worker_main() {
             if (err == cudaSuccess) {
                 err = cudaStreamSynchronize(cstream[job.dev]);
             }
+            if (err == cudaSuccess && dst_gate) {
+                memcpy(stage, job.src_gate, job.bytes);
+                err = cudaMemcpyAsync(dst_gate, stage, job.bytes, cudaMemcpyHostToDevice, cstream[job.dev]);
+                if (err == cudaSuccess) {
+                    err = cudaStreamSynchronize(cstream[job.dev]);
+                }
+            }
         } else if (err == cudaSuccess) {
             // pinned alloc failed: fall back to a direct pageable copy
             err = cudaMemcpy(dst, job.src, job.bytes, cudaMemcpyHostToDevice);
+            if (err == cudaSuccess && dst_gate) {
+                err = cudaMemcpy(dst_gate, job.src_gate, job.bytes, cudaMemcpyHostToDevice);
+            }
         }
 
         {
@@ -312,20 +358,24 @@ static void ec3_start_workers() {
 // simply gets its pool late. No visit order can lock a device out.
 struct ec3_discovery {
     std::unordered_set<uint64_t> seen;
-    struct shape { size_t size; int wtype; int n_tensors; };
+    struct shape { size_t size; int wtype; int n_tensors; int roles; };
     std::vector<shape> pending[EC3_MAX_DEV];   // shapes seen, pool not yet built
     bool any_repeat = false;
 };
 static ec3_discovery g_disc;
 
 // build one pool for (size, wtype) on device di; caller ensures no duplicate
-static bool ec3_pool_alloc(int di, size_t expert_size, int wtype, size_t budget) {
+static bool ec3_pool_alloc(int di, size_t expert_size, int wtype, size_t budget, bool paired) {
     ec3_device & d = g.dev[di];
     if (d.n_pools >= EC3_MAX_POOLS) return false;
 
     ggml_cuda_set_device(di);
 
-    int ns = (int)(budget / expert_size);
+    // a paired slot stores the (gate, up) tensors of one expert in two
+    // parallel slabs: same byte budget, half the slot count, same number of
+    // cached EXPERTS per byte as two independent entries — but joint by
+    // construction, which the fused kernel requires
+    int ns = (int)(budget / (paired ? 2 * expert_size : expert_size));
     if (ns < 64) {
         EC3_LOG("[ec3] dev=%d pool for %zu KB slots skipped (budget %zu MB too small)\n",
                 di, expert_size >> 10, budget >> 20);
@@ -339,19 +389,32 @@ static bool ec3_pool_alloc(int di, size_t expert_size, int wtype, size_t budget)
         EC3_LOG("[ec3] dev=%d pool alloc failed: %s\n", di, cudaGetErrorString(err));
         return false;
     }
+    char * slab2 = nullptr;
+    if (paired) {
+        err = cudaMalloc((void **)&slab2, (size_t)ns * expert_size);
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            cudaFree(slab);
+            EC3_LOG("[ec3] dev=%d paired pool alloc failed: %s\n", di, cudaGetErrorString(err));
+            return false;
+        }
+    }
 
     ec3_pool & p = d.pools[d.n_pools];
     p.expert_size = expert_size;
     p.wtype       = wtype;
     p.slab        = slab;
+    p.slab2       = slab2;
+    p.paired      = paired;
     p.n_slots     = ns;
     p.n_used      = 0;
     p.map.clear();
     p.lru_head = p.lru_tail = -1;
     p.slots.assign(ns, ec3_slot{0, -1, -1, false, false});
     d.n_pools++;
-    EC3_LOG("[ec3] dev=%d pool[%d]: type=%d slot=%zu KB slots=%d total=%zu MB\n",
-            di, d.n_pools - 1, wtype, expert_size >> 10, ns, ((size_t)ns * expert_size) >> 20);
+    EC3_LOG("[ec3] dev=%d pool[%d]: type=%d slot=%zu KB slots=%d total=%zu MB%s\n",
+            di, d.n_pools - 1, wtype, expert_size >> 10, ns,
+            ((size_t)(paired ? 2 : 1) * ns * expert_size) >> 20, paired ? " (paired)" : "");
 
     if (!d.compute_stream) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&d.compute_stream, cudaStreamNonBlocking));
@@ -399,12 +462,13 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
             if (sh.size == expert_size && sh.wtype == wtype) { shp = &sh; break; }
         }
         if (!shp) {
-            g_disc.pending[di].push_back({expert_size, wtype, 0});
+            g_disc.pending[di].push_back({expert_size, wtype, 0, 0});
             shp = &g_disc.pending[di].back();
             EC3_DBG("[ec3-dbg] new shape %s blk=%d dev=%d size=%zu type=%d\n",
                     name, blk, di, expert_size, wtype);
         }
         if (first_sight) shp->n_tensors++;   // distinct tensors using this shape
+        if (role >= 0) shp->roles |= 1 << role;
         if (!g_disc.any_repeat) {
             if (g_disc.seen.count(kb)) {
                 g_disc.any_repeat = true;
@@ -436,7 +500,8 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
             }
             for (auto & sh : pend) {
                 const double w = (double)sh.size * (sh.n_tensors > 0 ? sh.n_tensors : 1);
-                ec3_pool_alloc(di, sh.size, sh.wtype, (size_t)(avail * (w / total_w)));
+                const bool paired = g.fuse && (sh.roles & 0b11) == 0b11;
+                ec3_pool_alloc(di, sh.size, sh.wtype, (size_t)(avail * (w / total_w)), paired);
             }
         }
         pend.clear();
@@ -467,7 +532,13 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
 
     EC3_DBG("[ec3-dbg] begin %s dev=%d pool=%d role=%d\n", name, di, pi, role);
 
-    g.cur_key_base    = kb;
+    // paired pools share ONE entry per (blk, expert): key by blk, not by name
+    if (d.pools[pi].paired && (role == 0 || role == 1)) {
+        g.cur_key_base = 0xEC3000000000000ULL ^ ((uint64_t)blk << 32);
+        if (blk >= 0 && blk < 1024) g.role_base[role][blk] = host_base;
+    } else {
+        g.cur_key_base = kb;
+    }
     g.cur_host_base   = host_base;
     g.cur_expert_size = expert_size;
     g.cur_n_expert    = n_expert;
@@ -573,6 +644,15 @@ static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) 
             d.skip_throttle++;
             continue;
         }
+        // paired-entry inserts (gate/up roles only — pools can be SHARED with
+        // other roles whose tensors merely have the same shape; those use the
+        // plain name-keyed path below and never collide in key space)
+        const bool pair_entry = p.paired && (g.cur_role == 0 || g.cur_role == 1);
+        if (pair_entry && (g.cur_blk < 0 || g.cur_blk >= 1024 ||
+                           !g.role_base[0][g.cur_blk] || !g.role_base[1][g.cur_blk])) {
+            d.insert_skips++;
+            continue;
+        }
 
         int si = -1;
         if (p.n_used < p.n_slots) {
@@ -591,7 +671,14 @@ static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) 
             ec3_lru_remove(p, si);
         }
 
-        const char * src = (const char *)g.cur_host_base + (size_t)eid * g.cur_expert_size;
+        const void * src_up   = nullptr;
+        const void * src_gate = nullptr;
+        if (pair_entry) {
+            src_up   = (const char *)g.role_base[1][g.cur_blk] + (size_t)eid * g.cur_expert_size;
+            src_gate = (const char *)g.role_base[0][g.cur_blk] + (size_t)eid * g.cur_expert_size;
+        } else {
+            src_up = (const char *)g.cur_host_base + (size_t)eid * g.cur_expert_size;
+        }
 
         p.slots[si] = ec3_slot{key, -1, -1, false, true};
         ec3_lru_push_back(p, si);
@@ -600,9 +687,13 @@ static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) 
         d.ever_inserted.insert(key);
         inserts_left--;
 
-        g.queue.push_back(ec3_job{di, g.cur_pool, key, si, src, g.cur_expert_size});
+        g.queue.push_back(ec3_job{di, g.cur_pool, key, si, src_up, src_gate, g.cur_expert_size});
         g.cv.notify_one();
     }
+
+    // stash the per-position result so collect can reconstruct dst row indices
+    g.cur_n_ids = n_ids;
+    for (int k = 0; k < n_ids && k < 64; k++) g.cur_slot_idx[k] = slot_idx[k];
 
     // resolve any deferred gate collect that this node will not absorb
     // (absorbed only by the same layer's up node when it has hits of its own)
@@ -624,6 +715,14 @@ static void ec3_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_out, int
     const int64_t t0 = ggml_time_us();
     ec3_device & d = g.dev[di];
     ec3_pool   & p = d.pools[g.cur_pool];
+
+    const bool blk_ok     = g.cur_blk >= 0 && g.cur_blk < 1024;
+    const bool fuse_layer = p.paired && blk_ok && g.safe_fuse_blk[g.cur_blk];
+    if (fuse_layer && g.cur_role == 1) {
+        // fused rows were computed at the gate node; nothing to launch here
+        d.t_disp_us += ggml_time_us() - t0;
+        return;
+    }
     ggml_cuda_set_device(di);
     cudaStream_t st = d.compute_stream;
 
@@ -717,9 +816,21 @@ static void ec3_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_out, int
                                    n_in, /*s01=*/n_in, /*s02=*/(int64_t)act_n * n_in, /*s03=*/(int64_t)act_n * n_in,
                                    n_in_padded, /*ne1=*/act_n, /*ne2=*/1, /*ne3=*/1, s);
         }
-        ggml_cuda_ec3_mmv(p.slab, wtype, act_q8, d_ids_h, d.d_out + (size_t)d.out_rows * n_out,
+        const void * mmv_x   = p.slab;
+        const void * mmv_gate = nullptr;
+        int          mmv_glu  = -1;
+        if (p.paired) {
+            if (fuse_layer && g.cur_role == 0) {
+                // fused: x = up slab (result operand), gate slab silu'd on-chip
+                mmv_gate = p.slab2;
+                mmv_glu  = (int)GGML_GLU_OP_SWIGLU;
+            } else if (g.cur_role == 0) {
+                mmv_x = p.slab2;   // separate gate matvec reads the gate slab
+            }
+        }
+        ggml_cuda_ec3_mmv(mmv_x, wtype, act_q8, d_ids_h, d.d_out + (size_t)d.out_rows * n_out,
                           n_in, n_out, p.n_slots, (int64_t)p.expert_size,
-                          n_hits, /*act_rows=*/act_n, s);
+                          n_hits, /*act_rows=*/act_n, s, mmv_gate, mmv_glu);
     };
 
     // note: CUDA-graph capture of this chain was tried and measured to be a
@@ -740,15 +851,32 @@ static void ec3_stats(void);
 static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_out) {
     const int64_t t0 = ggml_time_us();
     ec3_device & d = g.dev[di];
-    const int new_rows = d.out_rows - d.pending_rows;
-    if (n_hits != new_rows) {
-        EC3_LOG("[ec3] BUG: collect rows %d != dispatched %d\n", n_hits, new_rows);
+
+    // fused-GLU learning must happen before any early return: record this
+    // node's dst base so the GLU hook can prove the pair wiring per layer
+    if (g.cur_pool >= 0 && d.pools[g.cur_pool].paired && n_hits > 0 &&
+        g.cur_blk >= 0 && g.cur_blk < 1024 && (g.cur_role == 0 || g.cur_role == 1)) {
+        int k0l = -1;
+        for (int k = 0; k < g.cur_n_ids; k++) {
+            if (g.cur_slot_idx[k] >= 0) { k0l = k; break; }
+        }
+        if (k0l >= 0) {
+            const char * dbase = (const char *)dst_rows[0] - (size_t)k0l * n_out * sizeof(float);
+            if (g.cur_role == 0) {
+                g.learn_gate_dst[g.cur_blk] = dbase;
+                g.glu_learn[dbase] = g.cur_blk;
+                EC3_DBG("[ec3-dbg] gate-dst blk=%d %p\n", g.cur_blk, (const void *)dbase);
+            } else {
+                g.learn_up_dst[g.cur_blk] = dbase;
+            }
+        }
     }
 
     // gate-defer: postpone this sync into the same layer's up node (only on
     // layers where up was observed to directly follow gate — see begin())
     if (g.defer && g.cur_role == 0 && !d.pending_active && n_hits <= 64 &&
-        g.cur_blk >= 0 && g.cur_blk < 1024 && g.safe_defer_blk[g.cur_blk]) {
+        g.cur_blk >= 0 && g.cur_blk < 1024 && g.safe_defer_blk[g.cur_blk] &&
+        !(g.fuse && g.cur_pool >= 0 && d.pools[g.cur_pool].paired && g.safe_fuse_blk[g.cur_blk])) {
         d.pending_active = true;
         d.pending_blk    = g.cur_blk;
         d.pending_rows   = n_hits;
@@ -777,6 +905,57 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
     }
 
     ggml_cuda_set_device(di);
+
+    // ---- fused gate+up+GLU path (paired pools) ----
+    if (g.cur_pool >= 0 && d.pools[g.cur_pool].paired && n_hits > 0 &&
+        g.cur_blk >= 0 && g.cur_blk < 1024 && (g.cur_role == 0 || g.cur_role == 1)) {
+        // reconstruct this node's dst base from the first hit's ids position
+        int k0 = -1;
+        for (int k = 0; k < g.cur_n_ids; k++) {
+            if (g.cur_slot_idx[k] >= 0) { k0 = k; break; }
+        }
+        const char * dst_base = k0 >= 0
+            ? (const char *)dst_rows[0] - (size_t)k0 * n_out * sizeof(float) : nullptr;
+
+        if (g.safe_fuse_blk[g.cur_blk]) {
+            if (g.cur_role == 0) {
+                // gate node of a fused layer: d_out holds the fused swiglu rows.
+                // D2H them (async) and hand off to the GLU hook; nothing is
+                // written to the gate/up MMID dsts (the GLU kernel skips these
+                // rows and nothing else reads them).
+                auto & f = d.fused;
+                f.active   = true;
+                f.scattered = false;
+                f.serial   = ++g.fuse_serial;
+                f.gate_dst = dst_base;
+                f.up_dst   = nullptr;   // filled at the up node
+                f.mask     = 0;
+                f.n        = 0;
+                f.n_out    = n_out;
+                for (int k = 0; k < g.cur_n_ids && f.n < 64; k++) {
+                    if (g.cur_slot_idx[k] < 0) continue;
+                    f.rows[f.n++] = k;
+                    f.mask |= 1ull << k;
+                }
+                const size_t bytes = (size_t)d.out_rows * n_out * sizeof(float);
+                CUDA_CHECK(cudaMemcpyAsync(d.h_out, d.d_out, bytes, cudaMemcpyDeviceToHost, d.compute_stream));
+                d.out_rows = 0;
+                d.q8_act_ptr = nullptr;
+                d.fused_layers++;
+                d.t_coll_us += ggml_time_us() - t0;
+                if (g.stats_every > 0 && ++g.collect_calls % g.stats_every == 0) ec3_stats();
+                return;
+            }
+            if (g.cur_role == 1) {
+                // up node of a fused layer: nothing was dispatched; just record
+                // the up dst base so the GLU hook can match the pair
+                if (d.fused.active && dst_base) d.fused.up_dst = dst_base;
+                d.out_rows = 0;
+                d.t_coll_us += ggml_time_us() - t0;
+                return;
+            }
+        }
+    }
 
     // ---- GPU-resident dst handoff (down nodes) ----
     // If the scheduler offered the consumer's GPU copy of this dst, scatter the
@@ -919,6 +1098,52 @@ static int ec3_redirect_finalize(const void * host_dst_data, void * consumer_bac
     return 1;
 }
 
+// ---- API: fused GLU hook ---------------------------------------------------------------
+
+static unsigned long long ec3_glu_hits(const void * src0_data, const void * src1_data,
+                                       void * dst_data, size_t dst_nb1, int ith) {
+    // learning: observing the GLU node whose inputs are a layer's gate/up MMID
+    // dsts proves the fused dispatch is safe for that layer
+    if (!g.fuse) return 0;
+    if (ith == 0) {
+        EC3_DBG("[ec3-dbg] glu call src0=%p src1=%p\n", src0_data, src1_data);
+    }
+    auto lit = g.glu_learn.find(src0_data);
+    if (lit == g.glu_learn.end()) return 0;
+    const int blk = lit->second;
+    if (blk >= 0 && blk < 1024 && g.learn_up_dst[blk] == src1_data && !g.safe_fuse_blk[blk]) {
+        g.safe_fuse_blk[blk] = true;
+        EC3_DBG("[ec3-dbg] fuse-safe blk=%d\n", blk);
+    }
+
+    // active fused rows for this pair? dst buffers are reused across layers,
+    // so several devices can hold matching (stale) entries — take the newest
+    int best = -1;
+    long long best_serial = -1;
+    for (int di = 0; di < g.n_dev; di++) {
+        auto & f = g.dev[di].fused;
+        if (!f.active || f.gate_dst != src0_data || f.up_dst != src1_data) continue;
+        if (f.serial > best_serial) { best_serial = f.serial; best = di; }
+    }
+    {
+        const int di = best;
+        if (di < 0) return 0;
+        auto & f = g.dev[di].fused;
+        if (ith == 0 && !f.scattered) {
+            ec3_device & d = g.dev[di];
+            ggml_cuda_set_device(di);
+            CUDA_CHECK(cudaStreamSynchronize(d.compute_stream));   // D2H of fused rows
+            for (int i = 0; i < f.n; i++) {
+                memcpy((char *)dst_data + (size_t)f.rows[i] * dst_nb1,
+                       d.h_out + (size_t)i * f.n_out,
+                       f.n_out * sizeof(float));
+            }
+            f.scattered = true;
+        }
+        return f.mask;
+    }
+}
+
 // ---- API: stats ----------------------------------------------------------------------
 
 static void ec3_stats(void) {
@@ -948,8 +1173,8 @@ static void ec3_stats(void) {
                     (double)d.t_plan_us / d.n_nodes, (double)d.t_disp_us / d.n_nodes,
                     (double)d.t_coll_us / d.n_nodes,
                     (double)(d.t_plan_us + d.t_disp_us + d.t_coll_us) / d.n_nodes);
-            EC3_LOG("[ec3] dev=%d redirect: claims=%lld miss-rows-up=%lld\n",
-                    i, d.redirect_claims, d.redirect_misses_up);
+            EC3_LOG("[ec3] dev=%d redirect: claims=%lld miss-rows-up=%lld fused-layers=%lld\n",
+                    i, d.redirect_claims, d.redirect_misses_up, d.fused_layers);
             EC3_LOG("[ec3] dev=%d coll-by-role: gate=%.1fus(n=%lld) up=%.1fus(n=%lld) down=%.1fus(n=%lld)\n", i,
                     d.n_coll_role[0] ? (double)d.t_coll_role_us[0]/d.n_coll_role[0] : 0.0, d.n_coll_role[0],
                     d.n_coll_role[1] ? (double)d.t_coll_role_us[1]/d.n_coll_role[1] : 0.0, d.n_coll_role[1],
@@ -1090,6 +1315,11 @@ void ggml_expert_cache_v3_register(void) {
     if (const char * e = getenv("LLAMA_EC3_DEFER"))         g.defer = atoi(e) > 0;
     if (const char * e = getenv("LLAMA_EC3_REUSE"))         g.reuse = atoi(e) > 0;
     if (const char * e = getenv("LLAMA_EC3_STRIPE"))        g.stripe = atoi(e) > 0;
+    if (const char * e = getenv("LLAMA_EC3_FUSE"))          g.fuse = atoi(e) > 0;
+    if (g.stripe && g.fuse) {
+        g.fuse = false;  // pair state is per-device; striping splits roles across devices
+        EC3_LOG("[ec3] stripe mode: fuse disabled\n");
+    }
     if (g.stripe) {
         // gate and up land on different devices: the defer absorb would dangle
         // past the swiglu read (corruption), and the act-quant reuse state is
@@ -1106,6 +1336,7 @@ void ggml_expert_cache_v3_register(void) {
     ggml_expert_cache_v3.stats    = ec3_stats;
     ggml_expert_cache_v3.redirect_offer    = ec3_redirect_offer;
     ggml_expert_cache_v3.redirect_finalize = ec3_redirect_finalize;
+    ggml_expert_cache_v3.glu_hits          = ec3_glu_hits;
     if (const char * e = getenv("LLAMA_EC3_REDIRECT")) g.redirect_on = atoi(e) > 0;
 
     EC3_LOG("[ec3] enabled: n_dev=%d budget=%s inserts/plan=%d workers=%d stats_every=%d\n",

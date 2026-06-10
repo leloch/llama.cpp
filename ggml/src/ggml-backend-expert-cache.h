@@ -65,6 +65,16 @@ struct ggml_expert_cache_v3_api {
     // stream-order dependency on the consumer backend) — the scheduler must
     // then SKIP its own copy. Returns 0 for the normal copy path.
     int (*redirect_finalize)(const void * host_dst_data, void * consumer_backend);
+
+    // ---- fused gate+up+GLU path ----
+    // Called by the CPU GLU kernel (swiglu split variant) from EVERY thread:
+    // returns the bitmask of dst rows the cache computed on the GPU (fused
+    // silu(gate)*up) — those rows must be SKIPPED by the CPU loop. Thread 0
+    // (ith == 0) additionally synchronizes the fused chain and scatters the
+    // GPU rows into dst before returning. Returns 0 when the cache has no
+    // pending fused work for this (src0, src1) pair.
+    unsigned long long (*glu_hits)(const void * src0_data, const void * src1_data,
+                                   void * dst_data, size_t dst_nb1, int ith);
 };
 
 // Zero-initialized in ggml-backend.cpp; populated by the CUDA backend in

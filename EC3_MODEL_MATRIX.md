@@ -32,6 +32,19 @@ Build: branch v3-expert-cache @ 83918dbee+. "Vanilla" = same binary, LLAMA_EC3=0
 
 *vanilla figure = best stock config (fitt), stricter than same-placement.
 
+### Forced-spill on ONE GPU (inflated fit margin; 4-arm)
+
+| Model (usable VRAM) | Auto (rule choice) | Vanilla static | Manual dyn + EC3 | Manual dyn vanilla | Rule verdict |
+|---|---|---|---|---|---|
+| Qwen3-30B (8G) | 101.8 (static) | 103.1 | 90.7 | 69.0 | correct: static > best dynamic |
+| ERNIE-21B (6G) | **110.0 (dynamic)** | 108.8 | 97.8 | 78.1 | correct: big-expert exception wins |
+| gpt-oss-120b (22G) | 55.5 (dynamic) | 56.2 | — | — | parity (-1.2%, tolerated) |
+
+### gpt-oss-120b adversarial correctness (forced, 4 GPU)
+SWIGLU_OAI + expert biases: fuse learning correctly refused (fused-layers=0),
+MXFP4 4.3MB experts cached, **+37.8% (60.7 vs 44.1)**, temp-0 IDENTICAL.
+Dormant at 4-GPU auto: 121.84 vs 121.83.
+
 ## Bugs found by this sweep (fixed, committed)
 1. Single-GPU light-spill placement loss (-6..-18%): per-device dispatch-chain
    serialization — fixed with the calibrated placement economics rule

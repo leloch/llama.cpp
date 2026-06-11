@@ -31,6 +31,7 @@
 #include <cstring>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -183,6 +184,7 @@ struct ec3_global {
     struct {
         bool enabled = true;       // LLAMA_EC3_PREFETCH=0 to disable
         bool active  = false;      // pools exist somewhere
+        int  phase   = 0;          // 0 = hot-set prior, 1 = sequential sweep
         int  blk     = 0;          // next block to backfill
         int  eid     = 0;          // next expert within the block
         bool done    = false;
@@ -241,6 +243,16 @@ struct ec3_global {
     // on experts that are FULLY resident (pair && down), so near-ties resolve
     // toward cached experts. Mixing weights stay unbiased (DeepSeek-V3 pattern).
     float    rbias_strength = 0.0f;      // LLAMA_EC3_RBIAS (0 = off)
+
+    // hot-set persistence: the residency bitmaps are saved periodically and
+    // preloaded as the backfill's FIRST pass on the next run with the same
+    // model fingerprint — the cache starts warm with yesterday's hot experts.
+    bool     hotset_enabled = true;      // LLAMA_EC3_HOTSET=0 to disable
+    uint64_t hot_pair[1024][4] = {};     // loaded prior (preferred backfill order)
+    uint64_t hot_down[1024][4] = {};
+    bool     hot_loaded = false;
+    int64_t  hotset_last_save = 0;
+    char     hotset_path[512] = {};
     uint64_t resident_pair[1024][4] = {};   // 256 experts / 64 bits
     uint64_t resident_down[1024][4] = {};
 
@@ -364,6 +376,10 @@ static void ec3_lru_push_back(ec3_pool & p, int idx) {
 // block inserts the paired gate/up entry and the down entry for every expert
 // until the owning pools fill. Returns false when the walk is exhausted.
 static bool ec3_backfill_next(ec3_job & out) {
+restart:
+    if (g.backfill.phase == 0 && !g.hot_loaded) {
+        g.backfill.phase = 1;   // no prior: straight to the sweep
+    }
     for (; g.backfill.blk < 1024; g.backfill.blk++, g.backfill.eid = 0) {
         const int blk = g.backfill.blk;
         const int di  = blk % g.n_dev;
@@ -378,6 +394,11 @@ static bool ec3_backfill_next(ec3_job & out) {
             const int unit = g.backfill.eid++;
             const int eid  = unit >> 1;
             const bool want_pair = (unit & 1) == 0;
+            if (g.backfill.phase == 0 && eid < 256) {
+                // hot-prior pass: only entries that were resident last session
+                const uint64_t * hb = want_pair ? g.hot_pair[blk] : g.hot_down[blk];
+                if (!((hb[eid >> 6] >> (eid & 63)) & 1)) continue;
+            }
 
             const int pi = want_pair ? g.blk_pair_pool[blk] : g.blk_down_pool[blk];
             if (pi < 0 || pi >= d.n_pools) continue;
@@ -405,8 +426,40 @@ static bool ec3_backfill_next(ec3_job & out) {
             return true;
         }
     }
+    if (g.backfill.phase == 0) {
+        // hot prior exhausted: run the sequential sweep for the rest
+        g.backfill.phase = 1;
+        g.backfill.blk = 0;
+        g.backfill.eid = 0;
+        goto restart;
+    }
     g.backfill.done = true;
     return false;
+}
+
+// periodic hot-set save (worker 0; runs from the idle tick so it fires even
+// when no inserts are flowing — short sessions still persist their hot set)
+static void ec3_hotset_save_tick(int wid) {
+    if (wid != 0 || !g.hotset_enabled || !g.hotset_path[0]) return;
+    const int64_t now = ggml_time_us();
+    if (now - g.hotset_last_save < 90 * 1000000ll) return;
+    g.hotset_last_save = now;
+    static uint64_t snap_pair[1024][4], snap_down[1024][4];
+    {
+        std::lock_guard<std::mutex> lk2(g.mu);
+        memcpy(snap_pair, g.resident_pair, sizeof(snap_pair));
+        memcpy(snap_down, g.resident_down, sizeof(snap_down));
+    }
+    char tmp[560];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", g.hotset_path);
+    FILE * f = fopen(tmp, "wb");
+    if (f) {
+        fwrite(snap_pair, 1, sizeof(snap_pair), f);
+        fwrite(snap_down, 1, sizeof(snap_down), f);
+        fclose(f);
+        rename(tmp, g.hotset_path);
+        EC3_DBG("[ec3-dbg] hot-set saved\n");
+    }
 }
 
 static void ec3_worker_main(int wid) {
@@ -426,6 +479,12 @@ static void ec3_worker_main(int wid) {
                 if (g.backfill.enabled && g.backfill.active && !g.backfill.done && ec3_backfill_next(job)) {
                     goto have_job;
                 }
+                lk.unlock();
+                ec3_hotset_save_tick(wid);
+                lk.lock();
+                if (!g.queue.empty()) {
+                    break;
+                }
                 g.cv.wait_for(lk, std::chrono::milliseconds(50));
             }
             job = g.queue.front();
@@ -438,6 +497,7 @@ static void ec3_worker_main(int wid) {
         ec3_pool & p = g.dev[job.dev].pools[job.pool];
         cudaSetDevice(job.dev);
         EC3_DBG("[ec3-dbg] worker job dev=%d slot=%d bytes=%zu\n", job.dev, job.slot_idx, job.bytes);
+
         char * dst = p.slab + (size_t)job.slot_idx * p.expert_size;
         char * dst_gate = job.src_gate ? p.slab2 + (size_t)job.slot_idx * p.expert_size : nullptr;
 
@@ -711,6 +771,28 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
         if (!announced) {
             announced = true;
             EC3_LOG("[ec3] decode loop detected, shape census stable — building pools\n");
+            if (g.hotset_enabled && !g.hotset_path[0]) {
+                // fingerprint: model-distinguishing facts known at this point
+                const char * home = getenv("HOME");
+                snprintf(g.hotset_path, sizeof(g.hotset_path),
+                         "%s/.cache/llama.cpp/ec3-hotset-%lldx%dx%zu-d%d.bin",
+                         home ? home : "/tmp", (long long)n_expert, blk >= 0 ? 1 : 0,
+                         expert_size, g.n_dev);
+                FILE * f = fopen(g.hotset_path, "rb");
+                if (f) {
+                    const bool ok = fread(g.hot_pair, 1, sizeof(g.hot_pair), f) == sizeof(g.hot_pair)
+                                 && fread(g.hot_down, 1, sizeof(g.hot_down), f) == sizeof(g.hot_down);
+                    fclose(f);
+                    if (ok) {
+                        g.hot_loaded = true;
+                        long bits = 0;
+                        for (int b2 = 0; b2 < 1024; b2++)
+                            for (int w2 = 0; w2 < 4; w2++)
+                                bits += __builtin_popcountll(g.hot_pair[b2][w2]);
+                        EC3_LOG("[ec3] hot-set prior loaded: %ld pair entries — backfill starts warm\n", bits);
+                    }
+                }
+            }
         }
         // steady state reached: build this device's pending pools in ONE
         // proportional pass. Budgets are weighted by referenced bytes per
@@ -1919,6 +2001,8 @@ void ggml_expert_cache_v3_register(void) {
     if (const char * e = getenv("LLAMA_EC3_FUSE"))          g.fuse = atoi(e) > 0;
     if (const char * e = getenv("LLAMA_EC3_MAX_BATCH"))     { int n = atoi(e); if (n >= 1 && n <= 8) g.max_batch = n; }
     if (const char * e = getenv("LLAMA_EC3_PREFETCH"))      g.backfill.enabled = atoi(e) > 0;
+    if (const char * e = getenv("LLAMA_EC3_HOTSET"))        g.hotset_enabled = atoi(e) > 0;
+    g.hotset_last_save = ggml_time_us();   // first save no sooner than one period in
     if (const char * e = getenv("LLAMA_EC3_RBIAS"))         g.rbias_strength = (float)atof(e);
     if (const char * e = getenv("LLAMA_EC3_ORACLE"))        { g.oracle_bias = atoi(e) > 0;
         if (g.oracle_bias) EC3_LOG("[ec3] ORACLE BIAS ON: outputs are intentionally wrong (speed-ceiling research)\n"); }

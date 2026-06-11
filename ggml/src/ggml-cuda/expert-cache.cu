@@ -49,6 +49,7 @@ struct ec3_slot {
     int      next;
     bool     valid;     // contents complete, lookups may hit
     bool     queued;    // insert copy queued or in flight
+    uint32_t nhits;     // popularity counter (tiering experiment)
 };
 
 struct ec3_pool {
@@ -118,6 +119,12 @@ struct ec3_device {
                                           // NEWEST entry, not any stale one
     } fused;
     long long fused_layers = 0;
+
+    // striping economics: fused-chain wall by hit-count bucket (fixed-vs-exec split)
+    int64_t   chain_t0 = 0;
+    int       chain_n  = 0;
+    long long chain_us[5]  = {};
+    long long chain_cnt[5] = {};
 
     // striping-probe: how much chain latency STICKS OUT past the CPU work
     long long glusync_us = 0, glusync_n = 0;     // fused-chain wait at the GLU node
@@ -227,6 +234,9 @@ struct ec3_global {
     uint64_t     blk_down_kb[1024] = {}; // down key base (name-hash ^ ptr-hash)
     const void * blk_down_base[1024] = {};
 
+    bool oracle_bias = false;            // LLAMA_EC3_ORACLE=1: research knob, replaces
+                                         // missed experts with cached ones (WRONG OUTPUTS;
+                                         // measures the routing-bias speed ceiling)
     bool fuse = true;                    // LLAMA_EC3_FUSE=0 to disable. Stale-entry
                                          // hazard (EC3_READINESS.md B1) closed by
                                          // gate-begin epoch invalidation + up-node
@@ -912,6 +922,14 @@ static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) 
                 ec3_lru_remove(p, si);
                 ec3_lru_push_back(p, si);
                 slot_idx[k] = si;
+                p.slots[si].nhits++;
+                d.hits++;
+                d.pool_hits[g.cur_pool]++;
+                n_hits++;
+            } else if (g.oracle_bias && p.lru_tail >= 0 && p.slots[p.lru_tail].valid) {
+                // oracle: serve the hottest resident expert instead (speed ceiling probe)
+                slot_idx[k] = p.lru_tail;
+                p.slots[p.lru_tail].nhits++;
                 d.hits++;
                 d.pool_hits[g.cur_pool]++;
                 n_hits++;
@@ -922,6 +940,22 @@ static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) 
                 d.pool_miss[g.cur_pool]++;
             }
             continue;
+        }
+
+        if (g.oracle_bias && p.n_used > 0) {
+            int si = (int)(key % (uint64_t)p.n_used);
+            for (int t2 = 0; t2 < 8; t2++) {
+                if (p.slots[si].valid) break;
+                si = (si + 1) % p.n_used;
+            }
+            if (p.slots[si].valid) {
+                slot_idx[k] = si;
+                p.slots[si].nhits++;
+                d.hits++;
+                d.pool_hits[g.cur_pool]++;
+                n_hits++;
+                continue;
+            }
         }
 
         d.misses++;
@@ -1269,6 +1303,8 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
                 }
                 const size_t bytes = (size_t)d.out_rows * n_out * sizeof(float);
                 ec3_ok(di, cudaMemcpyAsync(d.h_out, d.d_out, bytes, cudaMemcpyDeviceToHost, d.compute_stream), "fused D2H");
+                d.chain_t0 = ggml_time_us();
+                d.chain_n  = n_hits;
                 d.out_rows = 0;
                 d.q8_act_ptr = nullptr;
                 d.fused_layers++;
@@ -1489,6 +1525,12 @@ static unsigned long long ec3_glu_hits(const void * src0_data, const void * src1
                 ec3_ok(di, cudaStreamSynchronize(d.compute_stream), "glu sync");   // D2H of fused rows
             d.glusync_us += ggml_time_us() - gs0;
             d.glusync_n++;
+            if (d.chain_t0 > 0 && d.chain_n > 0) {
+                const int b = d.chain_n <= 6 ? 0 : d.chain_n <= 12 ? 1 : d.chain_n <= 18 ? 2 : d.chain_n <= 24 ? 3 : 4;
+                d.chain_us[b]  += ggml_time_us() - d.chain_t0;
+                d.chain_cnt[b] += 1;
+                d.chain_t0 = 0;
+            }
             for (int i = 0; i < f.n; i++) {
                 char * row = (char *)dst_data + (size_t)f.rows[i] * dst_nb1;
                 if (gok) memcpy(row, d.h_out + (size_t)i * f.n_out, f.n_out * sizeof(float));
@@ -1646,6 +1688,35 @@ static void ec3_stats(void) {
                     (double)(d.t_plan_us + d.t_disp_us + d.t_coll_us) / d.n_nodes);
             EC3_LOG("[ec3] dev=%d redirect: claims=%lld miss-rows-up=%lld fused-layers=%lld\n",
                     i, d.redirect_claims, d.redirect_misses_up, d.fused_layers);
+            if (i == 0) {
+                EC3_LOG("[ec3] bail-ewma: base=%.1fus(n=%lld) on=%.1fus(n=%lld)\n",
+                        g.bail.base_ewma, g.bail.base_n, g.bail.on_ewma, g.bail.on_n);
+            }
+            {
+                std::vector<uint32_t> hv;
+                for (int pi2 = 0; pi2 < d.n_pools; pi2++) {
+                    ec3_pool & pp = d.pools[pi2];
+                    for (int s2 = 0; s2 < pp.n_used; s2++) if (pp.slots[s2].valid) hv.push_back(pp.slots[s2].nhits);
+                }
+                if (hv.size() > 16) {
+                    std::sort(hv.begin(), hv.end(), std::greater<uint32_t>());
+                    long long tot = 0; for (auto v : hv) tot += v;
+                    auto cum = [&](double frac) {
+                        long long s3 = 0; size_t n3 = (size_t)(hv.size() * frac);
+                        for (size_t j = 0; j < n3; j++) s3 += hv[j];
+                        return tot > 0 ? 100.0 * s3 / tot : 0.0;
+                    };
+                    EC3_LOG("[ec3] dev=%d popularity: top10%%=%.0f%% top30%%=%.0f%% top50%%=%.0f%% of hits (slots=%zu)\n",
+                            i, cum(0.10), cum(0.30), cum(0.50), hv.size());
+                }
+            }
+            EC3_LOG("[ec3] dev=%d chain-buckets(us): 1-6=%.0f(n=%lld) 7-12=%.0f(n=%lld) 13-18=%.0f(n=%lld) 19-24=%.0f(n=%lld) 25+=%.0f(n=%lld)\n",
+                    i,
+                    d.chain_cnt[0] ? (double)d.chain_us[0]/d.chain_cnt[0] : 0.0, d.chain_cnt[0],
+                    d.chain_cnt[1] ? (double)d.chain_us[1]/d.chain_cnt[1] : 0.0, d.chain_cnt[1],
+                    d.chain_cnt[2] ? (double)d.chain_us[2]/d.chain_cnt[2] : 0.0, d.chain_cnt[2],
+                    d.chain_cnt[3] ? (double)d.chain_us[3]/d.chain_cnt[3] : 0.0, d.chain_cnt[3],
+                    d.chain_cnt[4] ? (double)d.chain_us[4]/d.chain_cnt[4] : 0.0, d.chain_cnt[4]);
             EC3_LOG("[ec3] dev=%d stickout: glu=%.1fus(n=%lld) down-ready=%lld down-wait=%.1fus(n=%lld)\n",
                     i, d.glusync_n ? (double)d.glusync_us/d.glusync_n : 0.0, d.glusync_n,
                     d.evt_ready,
@@ -1763,6 +1834,12 @@ static void ec3_selftest(void) {
     all &= ec3_selftest_one(0, GGML_TYPE_Q4_K, 2048, 768,  1, true);
     all &= ec3_selftest_one(0, GGML_TYPE_Q6_K, 2048, 768,  5, true);
     all &= ec3_selftest_one(0, GGML_TYPE_Q6_K, 512,  2048, 8, false);
+    if (getenv("LLAMA_EC3_NSWEEP")) {
+        EC3_LOG("[ec3-selftest] === n-sweep (striping economics: fixed vs per-row cost) ===\n");
+        for (int n : {1, 2, 4, 8, 16, 32}) {
+            ec3_selftest_one(0, GGML_TYPE_Q4_K, 5120, 3072, n, true);
+        }
+    }
     EC3_LOG("[ec3-selftest] %s\n", all ? "ALL PASS" : "FAILURES PRESENT");
 }
 
@@ -1797,6 +1874,8 @@ void ggml_expert_cache_v3_register(void) {
     if (const char * e = getenv("LLAMA_EC3_FUSE"))          g.fuse = atoi(e) > 0;
     if (const char * e = getenv("LLAMA_EC3_MAX_BATCH"))     { int n = atoi(e); if (n >= 1 && n <= 8) g.max_batch = n; }
     if (const char * e = getenv("LLAMA_EC3_PREFETCH"))      g.backfill.enabled = atoi(e) > 0;
+    if (const char * e = getenv("LLAMA_EC3_ORACLE"))        { g.oracle_bias = atoi(e) > 0;
+        if (g.oracle_bias) EC3_LOG("[ec3] ORACLE BIAS ON: outputs are intentionally wrong (speed-ceiling research)\n"); }
     memset(g.blk_pair_pool, -1, sizeof(g.blk_pair_pool));
     memset(g.blk_down_pool, -1, sizeof(g.blk_down_pool));
     if (g.stripe && g.fuse) {

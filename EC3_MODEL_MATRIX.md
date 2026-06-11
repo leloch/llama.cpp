@@ -68,3 +68,33 @@ gpt-oss-120b/20b F16 (SWIGLU_OAI adversarial), Qwen3-235B Q3_K_XL (mild spill),
 GLM-4.6 Q4_K_XL (357B spill), Llama-4-Scout (topk=1), DeepSeek-V2-Lite,
 granite-4.0-h-small (hybrid mamba), Mixtral 8x7B, OLMoE.
 754B/397B re-validation queued for quiet disk (download page-cache contention).
+
+---
+
+# EC3 final clean suite (2026-06-11, downloads paused, final build f80353ae7)
+
+| Model | Regime | Ours | Vanilla | Gain |
+|---|---|---|---|---|
+| glm51-754b | auto | **17.49** | 13.96 | **+25.3%** |
+| glm51-754b | forced | **18.32** | 11.71 | **+56.4%** |
+| qwen35-397b | auto | **30.25** | 28.18 | **+7.3%** |
+| qwen35-397b | forced | **30.21** | 21.49 | **+40.6%** |
+| qwen35-122b | auto | **74.98** | 74.98 | **+0.0%** |
+| qwen35-122b | forced | **49.82** | 44.49 | **+12.0%** |
+| minimax-m27 | forced | **44.77** | 34.60 | **+29.4%** |
+| qwen36-35b | forced | **85.33** | 77.20 | **+10.5%** |
+| qwen3-30b | forced | **93.44** | 69.22 | **+35.0%** |
+| ernie-21b | forced | **112.00** | 79.45 | **+41.0%** |
+| gptoss-120b | forced | **58.59** | 45.53 | **+28.7%** |
+| gptoss-20b | forced | **87.02** | 67.36 | **+29.2%** |
+| olmoe-7b | forced | **211.91** | 209.26 | **+1.3%** |
+| scout-109b | forced | **36.35** | 25.85 | **+40.6%** |
+| granite-h | forced | **57.73** | 36.87 | **+56.6%** |
+| dsv2-lite | forced | **76.67** | 61.85 | **+24.0%** |
+
+Notes: same -t per model both arms (IQ-quant models t=80, K-quant t=48 — the
+shipped guidance). Auto rows = zero-config user experience vs vanilla autofit.
+Forced rows = cache contribution in the CPU-offload regime. 122B auto = exact
+dormancy parity. New architectures granite-4.0-h (hybrid mamba) and
+DeepSeek-V2-Lite: first-try wins (+56.6% / +24.0%), temp-0 outputs IDENTICAL.
+16/16 comparisons positive or exact-parity; zero regressions.

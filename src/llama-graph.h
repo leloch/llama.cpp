@@ -154,6 +154,20 @@ public:
     const uint32_t n_pos_per_embd = 1;
 };
 
+// expert-cache routing bias (per-ubatch refresh of cache-residency bias)
+class llm_graph_input_ec3_bias : public llm_graph_input_i {
+public:
+    llm_graph_input_ec3_bias(uint32_t n_expert, int il) : n_expert(n_expert), il(il) {}
+    virtual ~llm_graph_input_ec3_bias() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * bias = nullptr; // F32 [n_expert] for this layer
+
+    const uint32_t n_expert;
+    const int il;
+};
+
 // temperature tuning, used by llama4
 class llm_graph_input_attn_temp : public llm_graph_input_i {
 public:

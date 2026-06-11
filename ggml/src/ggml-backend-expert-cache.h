@@ -84,6 +84,14 @@ struct ggml_expert_cache_v3_api {
     // Node wall-time sample for the bail-out judge. code is begin()'s return
     // value: -3 = pure-CPU baseline sample, >= 0 = cache-engaged sample.
     void (*node_time)(int code, int64_t wall_us);
+
+    // ---- cache-aware routing bias ----
+    // Fills dst[0..n_expert) with +strength for experts fully resident in the
+    // cache (gate+up AND down), 0 otherwise. Added to the router's SELECTION
+    // scores only (mixing weights stay unbiased). Active when the env knob
+    // LLAMA_EC3_RBIAS > 0.
+    int  (*router_bias_active)(void);
+    void (*router_bias)(int il, int n_expert, float * dst);
 };
 
 // Zero-initialized in ggml-backend.cpp; populated by the CUDA backend in

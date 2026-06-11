@@ -153,6 +153,8 @@ struct ec3_job {
     const void * src;        // up weights (paired) or sole tensor
     const void * src_gate;   // gate weights (paired pools), else NULL
     size_t     bytes;
+    int        blk = -1;     // routing-bias bitmap maintenance
+    int        eid = -1;
 };
 
 struct ec3_global {
@@ -233,6 +235,14 @@ struct ec3_global {
     int          blk_n_expert[1024] = {};
     uint64_t     blk_down_kb[1024] = {}; // down key base (name-hash ^ ptr-hash)
     const void * blk_down_base[1024] = {};
+
+    // cache-aware routing bias: per-blk residency bitmaps (pair = gate+up entry
+    // valid; down = down entry valid). The router's selection probs get +strength
+    // on experts that are FULLY resident (pair && down), so near-ties resolve
+    // toward cached experts. Mixing weights stay unbiased (DeepSeek-V3 pattern).
+    float    rbias_strength = 0.0f;      // LLAMA_EC3_RBIAS (0 = off)
+    uint64_t resident_pair[1024][4] = {};   // 256 experts / 64 bits
+    uint64_t resident_down[1024][4] = {};
 
     bool oracle_bias = false;            // LLAMA_EC3_ORACLE=1: research knob, replaces
                                          // missed experts with cached ones (WRONG OUTPUTS;
@@ -391,7 +401,7 @@ static bool ec3_backfill_next(ec3_job & out) {
                                     : (const char *)g.blk_down_base[blk] + (size_t)eid * p.expert_size,
                           want_pair ? (const char *)g.role_base[0][blk] + (size_t)eid * p.expert_size
                                     : nullptr,
-                          p.expert_size};
+                          p.expert_size, blk, eid};
             return true;
         }
     }
@@ -469,6 +479,10 @@ static void ec3_worker_main(int wid) {
             g.cv_idle.notify_all();
             ec3_slot & s = p.slots[job.slot_idx];
             if (s.queued && s.key == job.key) {
+                if (job.blk >= 0 && job.blk < 1024 && job.eid >= 0 && job.eid < 256) {
+                    (job.src_gate ? g.resident_pair : g.resident_down)[job.blk][job.eid >> 6]
+                        |= 1ull << (job.eid & 63);
+                }
                 s.queued = false;
                 if (err == cudaSuccess) {
                     s.valid = true;
@@ -1011,6 +1025,10 @@ static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) 
             if (old.valid || old.queued) {
                 p.map.erase(old.key);
                 d.evictions++;
+                // routing-bias bitmap: this expert is leaving residency. The key
+                // does not encode (blk,eid) reversibly, so clear lazily: a wrong
+                // stale bit only biases toward an expert that then misses (safe,
+                // self-correcting via re-insert or next eviction sweep).
             }
             ec3_lru_remove(p, si);
         }
@@ -1031,7 +1049,13 @@ static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) 
         d.ever_inserted.insert(key);
         inserts_left--;
 
-        g.queue.push_back(ec3_job{di, g.cur_pool, key, si, src_up, src_gate, g.cur_expert_size});
+        {
+            // role 2 fills the down bitmap; roles 0/1 (pair_entry) the pair bitmap
+            const int bblk = (g.cur_role == 2 || pair_entry) ? g.cur_blk : -1;
+            g.queue.push_back(ec3_job{di, g.cur_pool, key, si, src_up,
+                                      pair_entry ? src_gate : nullptr,
+                                      g.cur_expert_size, bblk, eid});
+        }
         g.cv.notify_one();
     }
 
@@ -1581,6 +1605,8 @@ extern "C" size_t ggml_expert_cache_v3_trim(int device) {
     d.pending_rows   = 0;
     d.out_rows       = 0;
     d.fused.active   = false;
+    memset(g.resident_pair, 0, sizeof(g.resident_pair));
+    memset(g.resident_down, 0, sizeof(g.resident_down));
     d.dead = true;
     EC3_LOG("[ec3] dev=%d TRIMMED %zu MB under VRAM pressure — cache off on this device\n",
             device, freed >> 20);
@@ -1623,6 +1649,25 @@ static void ec3_invalidate(const void * base, size_t size) {
     for (int b = 0; b < 1024; b++) {
         if (in_range(g.role_base[0][b])) g.role_base[0][b] = nullptr;
         if (in_range(g.role_base[1][b])) g.role_base[1][b] = nullptr;
+    }
+}
+
+// ---- API: cache-aware routing bias ------------------------------------------------------
+
+static int ec3_router_bias_active(void) {
+    return g.enabled && g.rbias_strength > 0.0f;
+}
+
+static void ec3_router_bias(int il, int n_expert, float * dst) {
+    const float s = (g.enabled && !g.bail.tripped) ? g.rbias_strength : 0.0f;
+    if (il < 0 || il >= 1024 || n_expert > 256 || s <= 0.0f) {
+        for (int e = 0; e < n_expert; e++) dst[e] = 0.0f;
+        return;
+    }
+    for (int e = 0; e < n_expert; e++) {
+        const bool res = ((g.resident_pair[il][e >> 6] >> (e & 63)) & 1) &&
+                         ((g.resident_down[il][e >> 6] >> (e & 63)) & 1);
+        dst[e] = res ? s : 0.0f;
     }
 }
 
@@ -1874,6 +1919,7 @@ void ggml_expert_cache_v3_register(void) {
     if (const char * e = getenv("LLAMA_EC3_FUSE"))          g.fuse = atoi(e) > 0;
     if (const char * e = getenv("LLAMA_EC3_MAX_BATCH"))     { int n = atoi(e); if (n >= 1 && n <= 8) g.max_batch = n; }
     if (const char * e = getenv("LLAMA_EC3_PREFETCH"))      g.backfill.enabled = atoi(e) > 0;
+    if (const char * e = getenv("LLAMA_EC3_RBIAS"))         g.rbias_strength = (float)atof(e);
     if (const char * e = getenv("LLAMA_EC3_ORACLE"))        { g.oracle_bias = atoi(e) > 0;
         if (g.oracle_bias) EC3_LOG("[ec3] ORACLE BIAS ON: outputs are intentionally wrong (speed-ceiling research)\n"); }
     memset(g.blk_pair_pool, -1, sizeof(g.blk_pair_pool));
@@ -1901,6 +1947,8 @@ void ggml_expert_cache_v3_register(void) {
     ggml_expert_cache_v3.glu_hits          = ec3_glu_hits;
     ggml_expert_cache_v3.invalidate        = ec3_invalidate;
     ggml_expert_cache_v3.node_time         = ec3_node_time;
+    ggml_expert_cache_v3.router_bias        = ec3_router_bias;
+    ggml_expert_cache_v3.router_bias_active = ec3_router_bias_active;
     if (const char * e = getenv("LLAMA_EC3_REDIRECT")) g.redirect_on = atoi(e) > 0;
 
     EC3_LOG("[ec3] enabled: n_dev=%d budget=%s inserts/plan=%d workers=%d stats_every=%d\n",

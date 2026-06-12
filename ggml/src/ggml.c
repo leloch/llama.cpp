@@ -33,6 +33,9 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <signal.h>
+#if !defined(_MSC_VER) && !defined(__MINGW32__)
+#include <sys/mman.h>
+#endif
 #if defined(__gnu_linux__)
 #include <syscall.h>
 #endif
@@ -332,7 +335,13 @@ void * ggml_aligned_malloc(size_t size) {
 #if defined(__s390x__)
     const int alignment = 256;
 #else
-    const int alignment = 64;
+    // Bump alignment to 2 MiB for large allocations so the kernel can
+    // back the region with transparent hugepages. madvise(MADV_HUGEPAGE)
+    // is also called below to opt in even when THP is in 'madvise' mode.
+    size_t alignment = 64;
+    if (size >= 2u * 1024u * 1024u) {
+        alignment = 2u * 1024u * 1024u;
+    }
 #endif
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -365,6 +374,13 @@ void * ggml_aligned_malloc(size_t size) {
     }
   #else
     int result = posix_memalign(&aligned_memory, alignment, size);
+    if (result == 0 && aligned_memory != NULL && size >= 2u * 1024u * 1024u) {
+        // Round size down to hugepage boundary; kernel only promotes whole 2 MiB chunks.
+        size_t hp_size = size & ~((size_t)(2u * 1024u * 1024u - 1));
+        if (hp_size > 0) {
+            madvise(aligned_memory, hp_size, MADV_HUGEPAGE);
+        }
+    }
   #endif
     if (result != 0) {
         // Handle allocation failure

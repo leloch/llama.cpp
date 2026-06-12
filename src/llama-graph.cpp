@@ -1,7 +1,5 @@
 #include "llama-graph.h"
 
-#include "../ggml/src/ggml-backend-expert-cache.h"
-
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -1001,15 +999,6 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
-void llm_graph_input_ec3_bias::set_input(const llama_ubatch * ubatch) {
-    GGML_UNUSED(ubatch);
-    if (!bias) {
-        return;
-    }
-    GGML_ASSERT(ggml_backend_buffer_is_host(bias->buffer));
-    ggml_expert_cache_v3.router_bias(il, (int) n_expert, (float *) bias->data);
-}
-
 llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
     inputs.emplace_back(std::move(input));
     return inputs.back().get();
@@ -1561,18 +1550,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         selection_probs = ggml_set_rows(ctx0, ggml_fill(ctx0, selection_groups, -INFINITY), selection_probs, expert_groups); // [n_exp_per_group, n_expert_groups, n_tokens]
         selection_probs = ggml_reshape_2d(ctx0, selection_probs, n_expert, n_tokens); // [n_expert, n_tokens]
         cb(selection_probs, "ffn_moe_probs_masked", il);
-    }
-
-    // expert-cache routing bias: nudge near-tie selections toward experts that
-    // are resident in the VRAM cache (selection only; mixing weights below use
-    // the unbiased probs — same pattern as the DeepSeek-V3 selection bias).
-    if (ggml_expert_cache_v3.router_bias_active && ggml_expert_cache_v3.router_bias_active() && n_expert <= 256) {
-        auto inp = std::make_unique<llm_graph_input_ec3_bias>((uint32_t) n_expert, il);
-        inp->bias = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_expert);
-        ggml_set_input(inp->bias);
-        selection_probs = ggml_add(ctx0, selection_probs, inp->bias);
-        cb(selection_probs, "ffn_moe_probs_ec3_biased", il);
-        res->add_input(std::move(inp));
     }
 
     // select experts

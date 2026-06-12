@@ -4,9 +4,7 @@
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
-#include "ggml-cuda/expert-cache.cuh"
-
-extern "C" size_t ggml_expert_cache_v3_trim(int device);
+#include "ggml-cuda/moe-cache.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -450,7 +448,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                 // when inactive); one degraded decode beats a process abort
 
                 (void)cudaGetLastError();
-                if (ggml_expert_cache_v3_trim(device) > 0) {
+                if (ggml_moe_cache_trim(device) > 0) {
                     err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
                 }
             }
@@ -5698,8 +5696,8 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
             ggml_backend_cuda_reg_context * ctx = new ggml_backend_cuda_reg_context;
             const int min_batch_size = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
 
-            // expert cache v3 (LLAMA_EC3=1): wires the CPU mul_mat_id GPU-row path
-            ggml_expert_cache_v3_register();
+            // MoE expert cache (GGML_CUDA_MOE_CACHE=1): wires the CPU mul_mat_id GPU-row path
+            ggml_moe_cache_register();
 
             for (int i = 0; i < ggml_cuda_info().device_count; i++) {
                 ggml_backend_cuda_device_context * dev_ctx = new ggml_backend_cuda_device_context;

@@ -1,4 +1,4 @@
-// Expert cache v3 — dynamic VRAM cache for CPU-resident MoE expert weights.
+// MoE expert cache — dynamic VRAM cache for CPU-resident MoE expert weights.
 //
 // Design (from first principles, replacing the v2 scheduler-hook prototype):
 //  - Integration lives inside the CPU mul_mat_id kernel (see ggml-cpu.c):
@@ -19,19 +19,18 @@
 // Keys are FNV-1a hashes of the weight tensor's name (stable across contexts
 // and mmap remaps) mixed with the expert id.
 
-#include "expert-cache.cuh"
+#include "moe-cache.cuh"
 #include "common.cuh"
 #include "mmvq.cuh"
 #include "quantize.cuh"
 #include "ggml-backend-impl.h"
-#include "../ggml-backend-expert-cache.h"
+#include "../ggml-backend-moe-cache.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
 #include <chrono>
-#include <cstdio>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -40,11 +39,15 @@
 #include <unordered_set>
 #include <vector>
 
-#define EC3_MAX_DEV    8
-#define EC3_MAX_POOLS  8
-#define EC3_LOG(...)   fprintf(stderr, __VA_ARGS__)
+#define MOE_CACHE_MAX_DEV    8
+#define MOE_CACHE_MAX_POOLS  8
 
-struct ec3_slot {
+// key-space tag for paired (gate, up) entries: keeps them disjoint from the
+// name-hash-keyed entries of unpaired pools that share the same shape
+#define MOE_CACHE_PAIR_KEY_TAG 0xEC3000000000000ULL
+#define MOE_CACHE_LOG(...)   fprintf(stderr, __VA_ARGS__)
+
+struct moe_cache_slot {
     uint64_t key;
     int      prev;
     int      next;
@@ -52,7 +55,7 @@ struct ec3_slot {
     bool     queued;    // insert copy queued or in flight
 };
 
-struct ec3_pool {
+struct moe_cache_pool {
     size_t expert_size = 0;   // == slot stride == source tensor nb[2]
     int    wtype       = -1;
     char * slab        = nullptr;   // up weights (mmv x operand)
@@ -61,14 +64,14 @@ struct ec3_pool {
     int    n_slots     = 0;
     int    n_used      = 0;
 
-    std::vector<ec3_slot> slots;
+    std::vector<moe_cache_slot> slots;
     std::unordered_map<uint64_t, int> map;
     int lru_head = -1;
     int lru_tail = -1;
 };
 
-struct ec3_device {
-    ec3_pool pools[EC3_MAX_POOLS];
+struct moe_cache_device {
+    moe_cache_pool pools[MOE_CACHE_MAX_POOLS];
     int      n_pools = 0;
     bool     dead    = false;   // CUDA failure or trim: cache permanently off here
 
@@ -114,7 +117,7 @@ struct ec3_device {
     long long hits = 0, misses = 0, inserts = 0, evictions = 0;
     long long insert_skips = 0, queued_misses = 0;
     // miss decomposition (counters only, no behavior change)
-    long long pool_hits[EC3_MAX_POOLS] = {}, pool_miss[EC3_MAX_POOLS] = {};
+    long long pool_hits[MOE_CACHE_MAX_POOLS] = {}, pool_miss[MOE_CACHE_MAX_POOLS] = {};
     long long miss_compulsory = 0, miss_capacity = 0, miss_admission = 0;
     long long skip_throttle = 0, skip_budget = 0, skip_qfull = 0, skip_lrubusy = 0;
     std::unordered_set<uint64_t> ever_seen, ever_inserted;
@@ -123,7 +126,7 @@ struct ec3_device {
     long long redirect_claims = 0, redirect_misses_up = 0;
 };
 
-struct ec3_job {
+struct moe_cache_job {
     int        dev;
     int        pool;
     uint64_t   key;
@@ -135,7 +138,7 @@ struct ec3_job {
     int        eid = -1;
 };
 
-struct ec3_global {
+struct moe_cache_global {
     bool   enabled  = false;
     int    n_dev    = 0;
     size_t budget_mb = 0;        // 0 = auto (free VRAM at init minus reserve)
@@ -143,22 +146,22 @@ struct ec3_global {
                                  // grows lazily AFTER our init; stealing it
                                  // crashes the model mid-decode (measured)
     int    inserts_per_plan = 8; // max inserts enqueued per plan() call
-    int    throttle_mod     = 8; // at capacity admit 1-in-N misses (LLAMA_EC3_THROTTLE)
+    int    throttle_mod     = 8; // at capacity admit 1-in-N misses (GGML_CUDA_MOE_CACHE_THROTTLE)
     int    queue_max        = 512;
     int    n_workers        = 4;
     size_t min_expert_bytes = 1u << 20; // skip models whose experts are too small
                                         // to amortize per-node dispatch (measured:
                                         // 0.45MB experts lose, 3MB+ win big)
     int    max_batch        = 1; // decode batches up to this size use the cache
-                                 // (LLAMA_EC3_MAX_BATCH; >1 for spec-verify/parallel)
+                                 // (GGML_CUDA_MOE_CACHE_MAX_BATCH; >1 for spec-verify/parallel)
     int    stats_every      = 0; // log every N collect() calls (0 = off)
 
-    ec3_device dev[EC3_MAX_DEV];
+    moe_cache_device dev[MOE_CACHE_MAX_DEV];
 
     // prefetch backfill cursor (guarded by mu): walks (blk, eid) space and
     // enqueues nothing — workers pull directly when the demand queue is empty
     struct {
-        bool enabled = true;       // LLAMA_EC3_PREFETCH=0 to disable
+        bool enabled = true;       // GGML_CUDA_MOE_CACHE_PREFETCH=0 to disable
         bool active  = false;      // pools exist somewhere
         int  phase   = 0;          // 0 = hot-set prior, 1 = sequential sweep
         int  blk     = 0;          // next block to backfill
@@ -170,7 +173,7 @@ struct ec3_global {
     std::mutex              mu;  // guards pools/queue of all devices
     std::condition_variable cv;
     std::condition_variable cv_idle;          // signaled when a worker finishes a job
-    std::deque<ec3_job>     queue;
+    std::deque<moe_cache_job>     queue;
     const void *            inflight_src[16] = {};   // per-worker current source
     size_t                  inflight_len[16] = {};
     bool                    workers_started = false;
@@ -187,7 +190,7 @@ struct ec3_global {
     int32_t      cur_slot_idx[64] = {};
     int          cur_n_ids = 0;
     std::unordered_map<const void *, int> glu_learn;  // gate MMID dst base -> blk
-    bool         reuse    = true; // LLAMA_EC3_REUSE=0 to disable act-quant reuse
+    bool         reuse    = true; // GGML_CUDA_MOE_CACHE_REUSE=0 to disable act-quant reuse
 
     // fused gate+up+GLU path. Pair-fused dispatch engages per layer only after
     // the CPU GLU hook was OBSERVED matching that layer's gate/up dst pair
@@ -205,7 +208,7 @@ struct ec3_global {
     // valid; down = down entry valid) are saved periodically and
     // preloaded as the backfill's FIRST pass on the next run with the same
     // model fingerprint — the cache starts warm with yesterday's hot experts.
-    bool     hotset_enabled = true;      // LLAMA_EC3_HOTSET=0 to disable
+    bool     hotset_enabled = true;      // GGML_CUDA_MOE_CACHE_HOTSET=0 to disable
     uint64_t hot_pair[1024][4] = {};     // loaded prior (preferred backfill order)
     uint64_t hot_down[1024][4] = {};
     bool     hot_loaded = false;
@@ -214,8 +217,8 @@ struct ec3_global {
     uint64_t resident_pair[1024][4] = {};   // 256 experts / 64 bits
     uint64_t resident_down[1024][4] = {};
 
-    bool fuse = true;                    // LLAMA_EC3_FUSE=0 to disable. Stale-entry
-                                         // hazard (EC3_READINESS.md B1) closed by
+    bool fuse = true;                    // GGML_CUDA_MOE_CACHE_FUSE=0 to disable. Stale-entry
+                                         // hazard (MOE_CACHE_READINESS.md B1) closed by
                                          // gate-begin epoch invalidation + up-node
                                          // mask reuse.
     long long fuse_serial = 0;
@@ -238,7 +241,7 @@ struct ec3_global {
         int     par = 0;           // pinned-image parity used by collect
     };
     std::unordered_map<const void *, redirect_entry> redirect;
-    bool redirect_on = true;       // LLAMA_EC3_REDIRECT=0 to disable
+    bool redirect_on = true;       // GGML_CUDA_MOE_CACHE_REDIRECT=0 to disable
 
     long long collect_calls = 0;
 
@@ -264,31 +267,31 @@ struct ec3_global {
 // intentionally leaked: detached worker threads reference this state through
 // process exit; running its destructor would tear a condition variable out
 // from under a waiting thread (observed as a hang in atexit).
-static ec3_global & g = *new ec3_global();
+static moe_cache_global & g = *new moe_cache_global();
 
-// LLAMA_EC3_DEBUG=1: trace the first calls of each API to locate stalls
+// GGML_CUDA_MOE_CACHE_DEBUG=1: trace the first calls of each API to locate stalls
 static int g_dbg = -1;
 static long long g_dbg_n = 0;
-#define EC3_DBG(...) do { \
-        if (g_dbg < 0) { const char * _e = getenv("LLAMA_EC3_DEBUG"); g_dbg = _e ? atoi(_e) : 0; } \
-        if (g_dbg > 0 && g_dbg_n++ < (g_dbg >= 10 ? (long long)g_dbg : 400)) { EC3_LOG(__VA_ARGS__); fflush(stderr); } \
+#define MOE_CACHE_DBG(...) do { \
+        if (g_dbg < 0) { const char * _e = getenv("GGML_CUDA_MOE_CACHE_DEBUG"); g_dbg = _e ? atoi(_e) : 0; } \
+        if (g_dbg > 0 && g_dbg_n++ < (g_dbg >= 10 ? (long long)g_dbg : 400)) { MOE_CACHE_LOG(__VA_ARGS__); fflush(stderr); } \
     } while (0)
 
 // checked CUDA call: on failure the device's cache is disabled (begin() will
 // refuse) and the caller takes its degraded-but-finite path — a transient CUDA
 // error must never abort the host process (the stock CPU path still works)
-static bool ec3_ok(int di, cudaError_t e, const char * what) {
+static bool moe_cache_ok(int di, cudaError_t e, const char * what) {
     if (e == cudaSuccess) return true;
     cudaGetLastError();
-    if (di >= 0 && di < EC3_MAX_DEV && !g.dev[di].dead) {
+    if (di >= 0 && di < MOE_CACHE_MAX_DEV && !g.dev[di].dead) {
         g.dev[di].dead = true;
-        EC3_LOG("[ec3] dev=%d DISABLED: %s failed: %s (CPU path takes over)\n",
+        MOE_CACHE_LOG("[moe-cache] dev=%d DISABLED: %s failed: %s (CPU path takes over)\n",
                 di, what, cudaGetErrorString(e));
     }
     return false;
 }
 
-static uint64_t ec3_fnv1a(const char * s) {
+static uint64_t moe_cache_fnv1a(const char * s) {
     uint64_t h = 0xcbf29ce484222325ULL;
     while (*s) {
         h ^= (unsigned char)*s++;
@@ -297,28 +300,28 @@ static uint64_t ec3_fnv1a(const char * s) {
     return h;
 }
 
-static inline uint64_t ec3_ptr_hash(const void * p) {
+static inline uint64_t moe_cache_ptr_hash(const void * p) {
     uint64_t v = (uint64_t)(uintptr_t)p;
     v *= 0xFF51AFD7ED558CCDULL;
     v ^= v >> 33;
     return v;
 }
 
-static inline uint64_t ec3_key(uint64_t name_hash, int eid) {
+static inline uint64_t moe_cache_key(uint64_t name_hash, int eid) {
     return name_hash ^ ((uint64_t)(uint32_t)eid * 0x9E3779B97F4A7C15ULL);
 }
 
 // ---- LRU helpers (caller holds g.mu) ---------------------------------------
 
-static void ec3_lru_remove(ec3_pool & p, int idx) {
-    ec3_slot & s = p.slots[idx];
+static void moe_cache_lru_remove(moe_cache_pool & p, int idx) {
+    moe_cache_slot & s = p.slots[idx];
     if (s.prev >= 0) p.slots[s.prev].next = s.next; else p.lru_head = s.next;
     if (s.next >= 0) p.slots[s.next].prev = s.prev; else p.lru_tail = s.prev;
     s.prev = s.next = -1;
 }
 
-static void ec3_lru_push_back(ec3_pool & p, int idx) {
-    ec3_slot & s = p.slots[idx];
+static void moe_cache_lru_push_back(moe_cache_pool & p, int idx) {
+    moe_cache_slot & s = p.slots[idx];
     s.prev = p.lru_tail;
     s.next = -1;
     if (p.lru_tail >= 0) p.slots[p.lru_tail].next = idx; else p.lru_head = idx;
@@ -330,7 +333,7 @@ static void ec3_lru_push_back(ec3_pool & p, int idx) {
 // pick the next backfill insert (g.mu held). Walks blocks in order; for each
 // block inserts the paired gate/up entry and the down entry for every expert
 // until the owning pools fill. Returns false when the walk is exhausted.
-static bool ec3_backfill_next(ec3_job & out) {
+static bool moe_cache_backfill_next(moe_cache_job & out) {
 restart:
     if (g.backfill.phase == 0 && !g.hot_loaded) {
         g.backfill.phase = 1;   // no prior: straight to the sweep
@@ -338,7 +341,7 @@ restart:
     for (; g.backfill.blk < 1024; g.backfill.blk++, g.backfill.eid = 0) {
         const int blk = g.backfill.blk;
         const int di  = blk % g.n_dev;
-        ec3_device & d = g.dev[di];
+        moe_cache_device & d = g.dev[di];
         if (d.dead || d.n_pools == 0) continue;
         if (g.blk_pair_pool[blk] < 0 && g.blk_down_pool[blk] < 0) continue;   // never visited
 
@@ -357,22 +360,22 @@ restart:
 
             const int pi = want_pair ? g.blk_pair_pool[blk] : g.blk_down_pool[blk];
             if (pi < 0 || pi >= d.n_pools) continue;
-            ec3_pool & p = d.pools[pi];
+            moe_cache_pool & p = d.pools[pi];
             if (!p.slab || p.n_used >= p.n_slots) continue;
             if (want_pair && (!p.paired || !g.role_base[0][blk] || !g.role_base[1][blk])) continue;
             if (!want_pair && !g.blk_down_base[blk]) continue;
 
             const uint64_t key = want_pair
-                ? ec3_key(0xEC3000000000000ULL ^ ((uint64_t)blk << 32) ^ ec3_ptr_hash(g.role_base[0][blk]), eid)
-                : ec3_key(g.blk_down_kb[blk], eid);
+                ? moe_cache_key(MOE_CACHE_PAIR_KEY_TAG ^ ((uint64_t)blk << 32) ^ moe_cache_ptr_hash(g.role_base[0][blk]), eid)
+                : moe_cache_key(g.blk_down_kb[blk], eid);
             if (p.map.count(key)) continue;
 
             const int si = p.n_used++;
-            p.slots[si] = ec3_slot{key, -1, -1, false, true};
-            ec3_lru_push_back(p, si);
+            p.slots[si] = moe_cache_slot{key, -1, -1, false, true};
+            moe_cache_lru_push_back(p, si);
             p.map[key] = si;
             d.inserts++;
-            out = ec3_job{di, pi, key, si,
+            out = moe_cache_job{di, pi, key, si,
                           want_pair ? (const char *)g.role_base[1][blk] + (size_t)eid * p.expert_size
                                     : (const char *)g.blk_down_base[blk] + (size_t)eid * p.expert_size,
                           want_pair ? (const char *)g.role_base[0][blk] + (size_t)eid * p.expert_size
@@ -394,7 +397,7 @@ restart:
 
 // periodic hot-set save (worker 0; runs from the idle tick so it fires even
 // when no inserts are flowing — short sessions still persist their hot set)
-static void ec3_hotset_save_tick(int wid) {
+static void moe_cache_hotset_save_tick(int wid) {
     if (wid != 0 || !g.hotset_enabled || !g.hotset_path[0]) return;
     const int64_t now = ggml_time_us();
     if (now - g.hotset_last_save < 90 * 1000000ll) return;
@@ -413,29 +416,29 @@ static void ec3_hotset_save_tick(int wid) {
         fwrite(snap_down, 1, sizeof(snap_down), f);
         fclose(f);
         rename(tmp, g.hotset_path);
-        EC3_DBG("[ec3-dbg] hot-set saved\n");
+        MOE_CACHE_DBG("[moe-cache-dbg] hot-set saved\n");
     }
 }
 
-static void ec3_worker_main(int wid) {
+static void moe_cache_worker_main(int wid) {
     // per-worker pinned staging buffer + per-device copy streams: the host
     // memcpy runs at RAM speed on this thread, the H2D is a true async DMA on
     // a dedicated stream — no pageable-copy driver contention with the
     // dispatch path's kernel launches.
     char * stage = nullptr;
     size_t stage_cap = 0;
-    cudaStream_t cstream[EC3_MAX_DEV] = {};
+    cudaStream_t cstream[MOE_CACHE_MAX_DEV] = {};
 
     for (;;) {
-        ec3_job job;
+        moe_cache_job job;
         {
             std::unique_lock<std::mutex> lk(g.mu);
             while (g.queue.empty()) {
-                if (g.backfill.enabled && g.backfill.active && !g.backfill.done && ec3_backfill_next(job)) {
+                if (g.backfill.enabled && g.backfill.active && !g.backfill.done && moe_cache_backfill_next(job)) {
                     goto have_job;
                 }
                 lk.unlock();
-                ec3_hotset_save_tick(wid);
+                moe_cache_hotset_save_tick(wid);
                 lk.lock();
                 if (!g.queue.empty()) {
                     break;
@@ -449,9 +452,9 @@ static void ec3_worker_main(int wid) {
             g.inflight_len[wid] = job.bytes;
         }
 
-        ec3_pool & p = g.dev[job.dev].pools[job.pool];
+        moe_cache_pool & p = g.dev[job.dev].pools[job.pool];
         cudaSetDevice(job.dev);
-        EC3_DBG("[ec3-dbg] worker job dev=%d slot=%d bytes=%zu\n", job.dev, job.slot_idx, job.bytes);
+        MOE_CACHE_DBG("[moe-cache-dbg] worker job dev=%d slot=%d bytes=%zu\n", job.dev, job.slot_idx, job.bytes);
 
         char * dst = p.slab + (size_t)job.slot_idx * p.expert_size;
         char * dst_gate = job.src_gate ? p.slab2 + (size_t)job.slot_idx * p.expert_size : nullptr;
@@ -492,7 +495,7 @@ static void ec3_worker_main(int wid) {
             g.inflight_src[wid] = nullptr;
             g.inflight_len[wid] = 0;
             g.cv_idle.notify_all();
-            ec3_slot & s = p.slots[job.slot_idx];
+            moe_cache_slot & s = p.slots[job.slot_idx];
             if (s.queued && s.key == job.key) {
                 if (job.blk >= 0 && job.blk < 1024 && job.eid >= 0 && job.eid < 256) {
                     (job.src_gate ? g.resident_pair : g.resident_down)[job.blk][job.eid >> 6]
@@ -510,18 +513,18 @@ static void ec3_worker_main(int wid) {
                 cudaGetLastError();
                 static int warned = 0;
                 if (warned++ < 3) {
-                    EC3_LOG("[ec3] insert copy failed: %s\n", cudaGetErrorString(err));
+                    MOE_CACHE_LOG("[moe-cache] insert copy failed: %s\n", cudaGetErrorString(err));
                 }
             }
         }
     }
 }
 
-static void ec3_start_workers() {
+static void moe_cache_start_workers() {
     if (g.workers_started) return;
     g.workers_started = true;
     for (int i = 0; i < g.n_workers && i < 16; i++) {
-        std::thread(ec3_worker_main, i).detach();
+        std::thread(moe_cache_worker_main, i).detach();
     }
 }
 
@@ -533,10 +536,10 @@ static void ec3_start_workers() {
 // allocations settle). There is no "warmup complete" latch: a shape first seen
 // late (odd per-layer quants, partial GPU placement, bench context churn)
 // simply gets its pool late. No visit order can lock a device out.
-struct ec3_discovery {
+struct moe_cache_discovery {
     std::unordered_set<uint64_t> seen;
     struct shape { size_t size; int wtype; int n_tensors; int roles; int64_t n_expert; };
-    std::vector<shape> pending[EC3_MAX_DEV];   // shapes seen, pool not yet built
+    std::vector<shape> pending[MOE_CACHE_MAX_DEV];   // shapes seen, pool not yet built
     bool any_repeat = false;
     // stable-census guard: pools are built only after the shape census has not
     // changed for a window of eligible visits AND a tensor has repeated. A
@@ -544,13 +547,13 @@ struct ec3_discovery {
     // 754B server lost its down pools to visit-order luck).
     int  stable_count = 0;
 };
-static ec3_discovery g_disc;
+static moe_cache_discovery g_disc;
 
 // build one pool for (size, wtype) on device di; caller ensures no duplicate
-static bool ec3_pool_alloc(int di, size_t expert_size, int wtype, size_t budget, bool paired,
+static bool moe_cache_pool_alloc(int di, size_t expert_size, int wtype, size_t budget, bool paired,
                            int64_t max_entries) {
-    ec3_device & d = g.dev[di];
-    if (d.n_pools >= EC3_MAX_POOLS) return false;
+    moe_cache_device & d = g.dev[di];
+    if (d.n_pools >= MOE_CACHE_MAX_POOLS) return false;
 
     ggml_cuda_set_device(di);
 
@@ -565,11 +568,11 @@ static bool ec3_pool_alloc(int di, size_t expert_size, int wtype, size_t budget,
     if (ns < 64) {
         static int warned = 0;
         if (warned++ < 2) {
-            EC3_LOG("[ec3] dev=%d pool for %zu KB slots skipped (budget %zu MB too small) — cache stays off for this shape\n",
+            MOE_CACHE_LOG("[moe-cache] dev=%d pool for %zu KB slots skipped (budget %zu MB too small) — cache stays off for this shape\n",
                     di, expert_size >> 10, budget >> 20);
         }
         // dead marker: prevents endless re-discovery + re-trigger + log spam
-        ec3_pool & p = d.pools[d.n_pools];
+        moe_cache_pool & p = d.pools[d.n_pools];
         p.expert_size = expert_size;
         p.wtype       = wtype;
         p.slab        = nullptr;
@@ -582,7 +585,7 @@ static bool ec3_pool_alloc(int di, size_t expert_size, int wtype, size_t budget,
     cudaError_t err = cudaMalloc((void **)&slab, (size_t)ns * expert_size);
     if (err != cudaSuccess) {
         cudaGetLastError();
-        EC3_LOG("[ec3] dev=%d pool alloc failed: %s\n", di, cudaGetErrorString(err));
+        MOE_CACHE_LOG("[moe-cache] dev=%d pool alloc failed: %s\n", di, cudaGetErrorString(err));
         return false;
     }
     char * slab2 = nullptr;
@@ -591,12 +594,12 @@ static bool ec3_pool_alloc(int di, size_t expert_size, int wtype, size_t budget,
         if (err != cudaSuccess) {
             cudaGetLastError();
             cudaFree(slab);
-            EC3_LOG("[ec3] dev=%d paired pool alloc failed: %s\n", di, cudaGetErrorString(err));
+            MOE_CACHE_LOG("[moe-cache] dev=%d paired pool alloc failed: %s\n", di, cudaGetErrorString(err));
             return false;
         }
     }
 
-    ec3_pool & p = d.pools[d.n_pools];
+    moe_cache_pool & p = d.pools[d.n_pools];
     p.expert_size = expert_size;
     p.wtype       = wtype;
     p.slab        = slab;
@@ -606,9 +609,9 @@ static bool ec3_pool_alloc(int di, size_t expert_size, int wtype, size_t budget,
     p.n_used      = 0;
     p.map.clear();
     p.lru_head = p.lru_tail = -1;
-    p.slots.assign(ns, ec3_slot{0, -1, -1, false, false});
+    p.slots.assign(ns, moe_cache_slot{0, -1, -1, false, false});
     d.n_pools++;
-    EC3_LOG("[ec3] dev=%d pool[%d]: type=%d slot=%zu KB slots=%d total=%zu MB%s\n",
+    MOE_CACHE_LOG("[moe-cache] dev=%d pool[%d]: type=%d slot=%zu KB slots=%d total=%zu MB%s\n",
             di, d.n_pools - 1, wtype, expert_size >> 10, ns,
             ((size_t)(paired ? 2 : 1) * ns * expert_size) >> 20, paired ? " (paired)" : "");
 
@@ -616,13 +619,13 @@ static bool ec3_pool_alloc(int di, size_t expert_size, int wtype, size_t budget,
         CUDA_CHECK(cudaStreamCreateWithFlags(&d.compute_stream, cudaStreamNonBlocking));
     }
 
-    ec3_start_workers();
+    moe_cache_start_workers();
     return true;
 }
 
 // ---- API: begin -----------------------------------------------------------------
 
-static int ec3_begin(const char * name, const void * host_base, size_t expert_size,
+static int moe_cache_begin(const char * name, const void * host_base, size_t expert_size,
                      int64_t n_in, int64_t n_out, int wtype, int64_t n_expert, int64_t n_tokens) {
     GGML_UNUSED(n_in); GGML_UNUSED(n_out);
 
@@ -681,18 +684,18 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
 
     const int di = blk % g.n_dev;
 
-    const uint64_t kb = ec3_fnv1a(name);
-    ec3_device & d = g.dev[di];
+    const uint64_t kb = moe_cache_fnv1a(name);
+    moe_cache_device & d = g.dev[di];
     if (d.dead) return -1;
     const bool first_sight = g_disc.seen.count(kb) == 0;
 
-    // shape discovery + on-demand pool construction (see ec3_discovery)
+    // shape discovery + on-demand pool construction (see moe_cache_discovery)
     int pi = -1;
     for (int i = 0; i < d.n_pools; i++) {
         if (d.pools[i].expert_size == expert_size && d.pools[i].wtype == wtype) { pi = i; break; }
     }
     if (pi < 0) {
-        ec3_discovery::shape * shp = nullptr;
+        moe_cache_discovery::shape * shp = nullptr;
         for (auto & sh : g_disc.pending[di]) {
             if (sh.size == expert_size && sh.wtype == wtype) { shp = &sh; break; }
         }
@@ -700,7 +703,7 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
             g_disc.pending[di].push_back({expert_size, wtype, 0, 0, n_expert});
             shp = &g_disc.pending[di].back();
             g_disc.stable_count = 0;   // census changed: restart the stability window
-            EC3_DBG("[ec3-dbg] new shape %s blk=%d dev=%d size=%zu type=%d\n",
+            MOE_CACHE_DBG("[moe-cache-dbg] new shape %s blk=%d dev=%d size=%zu type=%d\n",
                     name, blk, di, expert_size, wtype);
         } else {
             g_disc.stable_count++;
@@ -722,26 +725,31 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
         static bool announced = false;
         if (!announced) {
             announced = true;
-            EC3_LOG("[ec3] decode loop detected, shape census stable — building pools\n");
+            MOE_CACHE_LOG("[moe-cache] decode loop detected, shape census stable — building pools\n");
             if (g.hotset_enabled && !g.hotset_path[0]) {
                 // fingerprint: model-distinguishing facts known at this point
-                const char * home = getenv("HOME");
-                snprintf(g.hotset_path, sizeof(g.hotset_path),
-                         "%s/.cache/llama.cpp/ec3-hotset-%lldx%dx%zu-d%d.bin",
-                         home ? home : "/tmp", (long long)n_expert, blk >= 0 ? 1 : 0,
-                         expert_size, g.n_dev);
-                FILE * f = fopen(g.hotset_path, "rb");
-                if (f) {
-                    const bool ok = fread(g.hot_pair, 1, sizeof(g.hot_pair), f) == sizeof(g.hot_pair)
-                                 && fread(g.hot_down, 1, sizeof(g.hot_down), f) == sizeof(g.hot_down);
-                    fclose(f);
-                    if (ok) {
-                        g.hot_loaded = true;
-                        long bits = 0;
-                        for (int b2 = 0; b2 < 1024; b2++)
-                            for (int w2 = 0; w2 < 4; w2++)
-                                bits += __builtin_popcountll(g.hot_pair[b2][w2]);
-                        EC3_LOG("[ec3] hot-set prior loaded: %ld pair entries — backfill starts warm\n", bits);
+                const char * base = getenv("HOME");           // POSIX
+                if (!base) base = getenv("LOCALAPPDATA");     // Windows
+                if (!base) {
+                    g.hotset_enabled = false;                 // no cache dir: skip persistence
+                } else {
+                    snprintf(g.hotset_path, sizeof(g.hotset_path),
+                             "%s/.cache/llama.cpp/moe-cache-hotset-%lldx%dx%zu-d%d.bin",
+                             base, (long long)n_expert, blk >= 0 ? 1 : 0,
+                             expert_size, g.n_dev);
+                    FILE * f = fopen(g.hotset_path, "rb");
+                    if (f) {
+                        const bool ok = fread(g.hot_pair, 1, sizeof(g.hot_pair), f) == sizeof(g.hot_pair)
+                                     && fread(g.hot_down, 1, sizeof(g.hot_down), f) == sizeof(g.hot_down);
+                        fclose(f);
+                        if (ok) {
+                            g.hot_loaded = true;
+                            long bits = 0;
+                            for (int b2 = 0; b2 < 1024; b2++)
+                                for (int w2 = 0; w2 < 4; w2++)
+                                    bits += __builtin_popcountll(g.hot_pair[b2][w2]);
+                            MOE_CACHE_LOG("[moe-cache] hot-set prior loaded: %ld pair entries — backfill starts warm\n", bits);
+                        }
                     }
                 }
             }
@@ -769,10 +777,10 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
             // 24 GB device while gate/up hit 77%). Budget by role group first,
             // then allocate within the group largest-first, folding the share
             // of dead fragments into the survivors.
-            auto shape_w = [](const ec3_discovery::shape & sh) {
+            auto shape_w = [](const moe_cache_discovery::shape & sh) {
                 return (double)sh.size * (sh.n_tensors > 0 ? sh.n_tensors : 1);
             };
-            auto is_paired_sh = [&](const ec3_discovery::shape & sh) {
+            auto is_paired_sh = [&](const moe_cache_discovery::shape & sh) {
                 return g.fuse && (sh.roles & 0b11) == 0b11;
             };
             double w_pair = 0.0, w_rest = 0.0;
@@ -780,10 +788,10 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
                 (is_paired_sh(sh) ? w_pair : w_rest) += shape_w(sh);
             }
             const double w_all = w_pair + w_rest;
-            std::vector<const ec3_discovery::shape *> order;
+            std::vector<const moe_cache_discovery::shape *> order;
             for (auto & sh : pend) order.push_back(&sh);
             std::sort(order.begin(), order.end(),
-                      [&](const ec3_discovery::shape * a, const ec3_discovery::shape * b) {
+                      [&](const moe_cache_discovery::shape * a, const moe_cache_discovery::shape * b) {
                           return shape_w(*a) > shape_w(*b);
                       });
             size_t group_left[2] = {                       // [0]=paired, [1]=rest
@@ -801,7 +809,7 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
                 const size_t need = (size_t)max_entries * sh.size * (paired ? 2 : 1);
                 if (budget > need) budget = need;          // never strand bytes in caps
                 const size_t before = budget;
-                if (ec3_pool_alloc(di, sh.size, sh.wtype, budget, paired, max_entries)) {
+                if (moe_cache_pool_alloc(di, sh.size, sh.wtype, budget, paired, max_entries)) {
                     group_left[gidx] -= before;            // consumed (approx; slack folds forward)
                 }
                 // dead fragments consume nothing: their share flows to the
@@ -828,7 +836,7 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
     // fused-state epoch: every gate node on a device invalidates any leftover
     // fused entry (zero-hit gate nodes never reach collect, and gallocr reuses
     // dst pointers across layers — a stale entry must never survive into the
-    // next layer's GLU; see EC3_READINESS.md B1)
+    // next layer's GLU; see MOE_CACHE_READINESS.md B1)
     if (role == 0) {
         g.dev[di].fused.active = false;
     }
@@ -836,7 +844,7 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
     g.cur_blk  = blk;
     g.cur_role = role;
 
-    EC3_DBG("[ec3-dbg] begin %s dev=%d pool=%d role=%d\n", name, di, pi, role);
+    MOE_CACHE_DBG("[moe-cache-dbg] begin %s dev=%d pool=%d role=%d\n", name, di, pi, role);
 
     if (blk >= 0 && blk < 1024) {
         g.blk_n_expert[blk] = (int)n_expert;
@@ -845,7 +853,7 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
             g.role_base[role][blk] = host_base;   // backfill pair sources (also pre-PP-bail)
         } else if (role == 2) {
             g.blk_down_pool[blk] = (int8_t)pi;
-            g.blk_down_kb[blk]   = kb ^ ec3_ptr_hash(host_base);
+            g.blk_down_kb[blk]   = kb ^ moe_cache_ptr_hash(host_base);
             g.blk_down_base[blk] = host_base;
         }
         g.backfill.active = true;
@@ -860,8 +868,8 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
     // bail-out phases (decode visits on a working pool only)
     if (!g.bail.tripped) {
         const long long vis = g.bail.eligible_seen++;
-        if (vis < ec3_global::BAIL_WARM) return -1;        // warmup: no sample
-        if (vis < ec3_global::BAIL_SAMPLE) return -3;      // pure CPU + timing sample
+        if (vis < moe_cache_global::BAIL_WARM) return -1;        // warmup: no sample
+        if (vis < moe_cache_global::BAIL_SAMPLE) return -3;      // pure CPU + timing sample
     }
 
     // paired pools share ONE entry per (blk, expert): key by blk + the GATE
@@ -871,9 +879,9 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
         if (blk >= 0 && blk < 1024) g.role_base[role][blk] = host_base;
         const void * anchor = (blk >= 0 && blk < 1024 && g.role_base[0][blk])
                               ? g.role_base[0][blk] : host_base;
-        g.cur_key_base = 0xEC3000000000000ULL ^ ((uint64_t)blk << 32) ^ ec3_ptr_hash(anchor);
+        g.cur_key_base = MOE_CACHE_PAIR_KEY_TAG ^ ((uint64_t)blk << 32) ^ moe_cache_ptr_hash(anchor);
     } else {
-        g.cur_key_base = kb ^ ec3_ptr_hash(host_base);
+        g.cur_key_base = kb ^ moe_cache_ptr_hash(host_base);
     }
     g.cur_host_base   = host_base;
     g.cur_expert_size = expert_size;
@@ -885,9 +893,9 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
 
 // ---- API: plan --------------------------------------------------------------------
 
-static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) {
-    ec3_device & d = g.dev[di];
-    ec3_pool   & p = d.pools[g.cur_pool];
+static int moe_cache_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) {
+    moe_cache_device & d = g.dev[di];
+    moe_cache_pool   & p = d.pools[g.cur_pool];
 
     const int64_t t0 = ggml_time_us();
 
@@ -920,15 +928,15 @@ static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) 
         slot_idx[k] = -1;
         const int eid = ids[k];
         if (eid < 0 || eid >= g.cur_n_expert) continue;
-        const uint64_t key = ec3_key(g.cur_key_base, eid);
+        const uint64_t key = moe_cache_key(g.cur_key_base, eid);
 
         auto it = p.map.find(key);
         if (it != p.map.end()) {
             const int si = it->second;
-            ec3_slot & s = p.slots[si];
+            moe_cache_slot & s = p.slots[si];
             if (s.valid) {
-                ec3_lru_remove(p, si);
-                ec3_lru_push_back(p, si);
+                moe_cache_lru_remove(p, si);
+                moe_cache_lru_push_back(p, si);
                 slot_idx[k] = si;
                 d.hits++;
                 d.pool_hits[g.cur_pool]++;
@@ -991,7 +999,7 @@ static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) 
             while (cand >= 0 && p.slots[cand].queued && guard++ < 64) cand = p.slots[cand].next;
             if (cand < 0 || p.slots[cand].queued) { d.insert_skips++; d.skip_lrubusy++; continue; }
             si = cand;
-            ec3_slot & old = p.slots[si];
+            moe_cache_slot & old = p.slots[si];
             if (old.valid || old.queued) {
                 p.map.erase(old.key);
                 d.evictions++;
@@ -1000,7 +1008,7 @@ static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) 
                 // a stale bit merely makes the next session's warm backfill load
                 // one expert that is no longer hot (harmless).
             }
-            ec3_lru_remove(p, si);
+            moe_cache_lru_remove(p, si);
         }
 
         const void * src_up   = nullptr;
@@ -1012,8 +1020,8 @@ static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) 
             src_up = (const char *)g.cur_host_base + (size_t)eid * g.cur_expert_size;
         }
 
-        p.slots[si] = ec3_slot{key, -1, -1, false, true};
-        ec3_lru_push_back(p, si);
+        p.slots[si] = moe_cache_slot{key, -1, -1, false, true};
+        moe_cache_lru_push_back(p, si);
         p.map[key] = si;
         d.inserts++;
         d.ever_inserted.insert(key);
@@ -1022,7 +1030,7 @@ static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) 
         {
             // role 2 fills the down bitmap; roles 0/1 (pair_entry) the pair bitmap
             const int bblk = (g.cur_role == 2 || pair_entry) ? g.cur_blk : -1;
-            g.queue.push_back(ec3_job{di, g.cur_pool, key, si, src_up,
+            g.queue.push_back(moe_cache_job{di, g.cur_pool, key, si, src_up,
                                       pair_entry ? src_gate : nullptr,
                                       g.cur_expert_size, bblk, eid});
         }
@@ -1035,18 +1043,18 @@ static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) 
 
     d.t_plan_us += ggml_time_us() - t0;
     d.n_nodes++;
-    EC3_DBG("[ec3-dbg] plan dev=%d hits=%d q=%zu\n", di, n_hits, g.queue.size());
+    MOE_CACHE_DBG("[moe-cache-dbg] plan dev=%d hits=%d q=%zu\n", di, n_hits, g.queue.size());
     return n_hits;
 }
 
 // ---- API: dispatch ------------------------------------------------------------------
 
-static void ec3_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_out, int n_hits,
+static void moe_cache_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_out, int n_hits,
                          const int32_t * slot_idx_compact, const float * const * act_rows) {
     if (n_hits <= 0) return;
     const int64_t t0 = ggml_time_us();
-    ec3_device & d = g.dev[di];
-    ec3_pool   & p = d.pools[g.cur_pool];
+    moe_cache_device & d = g.dev[di];
+    moe_cache_pool   & p = d.pools[g.cur_pool];
 
     const bool blk_ok     = g.cur_blk >= 0 && g.cur_blk < 1024;
     const bool fuse_layer = g.cur_n_tokens == 1 && p.paired && blk_ok && g.safe_fuse_blk[g.cur_blk];
@@ -1076,8 +1084,8 @@ static void ec3_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_out, int
         if (d.h_ids) cudaFreeHost(d.h_ids);
         if (d.d_ids) cudaFree(d.d_ids);
         d.h_ids = nullptr; d.d_ids = nullptr;
-        if (!ec3_ok(di, cudaMallocHost((void **)&d.h_ids, cap * sizeof(int32_t)), "ids host alloc") ||
-            !ec3_ok(di, cudaMalloc((void **)&d.d_ids, cap * sizeof(int32_t)), "ids dev alloc")) {
+        if (!moe_cache_ok(di, cudaMallocHost((void **)&d.h_ids, cap * sizeof(int32_t)), "ids host alloc") ||
+            !moe_cache_ok(di, cudaMalloc((void **)&d.d_ids, cap * sizeof(int32_t)), "ids dev alloc")) {
             d.out_rows += n_hits;
             return;
         }
@@ -1089,8 +1097,8 @@ static void ec3_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_out, int
         if (d.h_act) cudaFreeHost(d.h_act);
         if (d.d_act) cudaFree(d.d_act);
         d.h_act = nullptr; d.d_act = nullptr;
-        if (!ec3_ok(di, cudaMallocHost((void **)&d.h_act, cap), "act host alloc") ||
-            !ec3_ok(di, cudaMalloc((void **)&d.d_act, cap), "act dev alloc")) {
+        if (!moe_cache_ok(di, cudaMallocHost((void **)&d.h_act, cap), "act host alloc") ||
+            !moe_cache_ok(di, cudaMalloc((void **)&d.d_act, cap), "act dev alloc")) {
             d.out_rows += n_hits;
             return;
         }
@@ -1105,7 +1113,7 @@ static void ec3_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_out, int
         const size_t cap = need_q8 * 2;
         if (d.d_act_q8) cudaFree(d.d_act_q8);
         d.d_act_q8 = nullptr;
-        if (!ec3_ok(di, cudaMalloc(&d.d_act_q8, cap), "q8 alloc")) {
+        if (!moe_cache_ok(di, cudaMalloc(&d.d_act_q8, cap), "q8 alloc")) {
             d.out_rows += n_hits;
             return;
         }
@@ -1116,7 +1124,7 @@ static void ec3_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_out, int
         const size_t cap = ((size_t)(d.out_rows + n_hits) * n_out * sizeof(float)) * 2 + 65536;
         if (d.d_out) cudaFree(d.d_out);
         d.d_out = nullptr;
-        if (!ec3_ok(di, cudaMalloc((void **)&d.d_out, cap), "out dev alloc")) {
+        if (!moe_cache_ok(di, cudaMalloc((void **)&d.d_out, cap), "out dev alloc")) {
             d.out_rows += n_hits;
             return;
         }
@@ -1126,7 +1134,7 @@ static void ec3_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_out, int
         const size_t cap = need_out * 2 + 65536;
         if (d.h_out) cudaFreeHost(d.h_out);
         d.h_out = nullptr;
-        if (!ec3_ok(di, cudaMallocHost((void **)&d.h_out, cap), "out host alloc")) {
+        if (!moe_cache_ok(di, cudaMallocHost((void **)&d.h_out, cap), "out host alloc")) {
             d.out_rows += n_hits;
             return;
         }
@@ -1154,9 +1162,9 @@ static void ec3_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_out, int
     // captured once into a CUDA graph and replayed as a single launch — the
     // chain's per-op launch latency is the dominant per-node cost.
     auto emit_chain = [&](cudaStream_t s) {
-        if (!ec3_ok(di, cudaMemcpyAsync(d_ids_h, h_ids_h, n_hits * sizeof(int32_t), cudaMemcpyHostToDevice, s), "ids H2D")) return;
+        if (!moe_cache_ok(di, cudaMemcpyAsync(d_ids_h, h_ids_h, n_hits * sizeof(int32_t), cudaMemcpyHostToDevice, s), "ids H2D")) return;
         if (!reuse_q8) {
-            if (!ec3_ok(di, cudaMemcpyAsync(d_act_h, h_act_h, need_act, cudaMemcpyHostToDevice, s), "act H2D")) return;
+            if (!moe_cache_ok(di, cudaMemcpyAsync(d_act_h, h_act_h, need_act, cudaMemcpyHostToDevice, s), "act H2D")) return;
             quantize_row_q8_1_cuda(d_act_h, /*ids=*/nullptr, (void *)act_q8, wtype,
                                    n_in, /*s01=*/n_in, /*s02=*/(int64_t)act_n * n_in, /*s03=*/(int64_t)act_n * n_in,
                                    n_in_padded, /*ne1=*/act_n, /*ne2=*/1, /*ne3=*/1, s);
@@ -1173,7 +1181,7 @@ static void ec3_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_out, int
                 mmv_x = p.slab2;   // separate gate matvec reads the gate slab
             }
         }
-        ggml_cuda_ec3_mmv(mmv_x, wtype, act_q8, d_ids_h, d.d_out + (size_t)d.out_rows * n_out,
+        ggml_cuda_moe_cache_mmv(mmv_x, wtype, act_q8, d_ids_h, d.d_out + (size_t)d.out_rows * n_out,
                           n_in, n_out, p.n_slots, (int64_t)p.expert_size,
                           n_hits, /*act_rows=*/act_n, s, mmv_gate, mmv_glu);
     };
@@ -1185,17 +1193,17 @@ static void ec3_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_out, int
 
     d.out_rows += n_hits;
     d.t_disp_us += ggml_time_us() - t0;
-    EC3_DBG("[ec3-dbg] dispatch dev=%d hits=%d act_n=%d n_in=%lld n_out=%lld\n",
+    MOE_CACHE_DBG("[moe-cache-dbg] dispatch dev=%d hits=%d act_n=%d n_in=%lld n_out=%lld\n",
             di, n_hits, act_n, (long long)n_in, (long long)n_out);
 }
 
 // ---- API: collect --------------------------------------------------------------------
 
-static void ec3_stats(void);
+static void moe_cache_stats(void);
 
-static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_out) {
+static void moe_cache_collect(int di, int n_hits, float * const * dst_rows, int64_t n_out) {
     const int64_t t0 = ggml_time_us();
-    ec3_device & d = g.dev[di];
+    moe_cache_device & d = g.dev[di];
 
     // fused-GLU learning must happen before any early return: record this
     // node's dst base so the GLU hook can prove the pair wiring per layer
@@ -1210,7 +1218,7 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
             if (g.cur_role == 0) {
                 g.learn_gate_dst[g.cur_blk] = dbase;
                 g.glu_learn[dbase] = g.cur_blk;
-                EC3_DBG("[ec3-dbg] gate-dst blk=%d %p\n", g.cur_blk, (const void *)dbase);
+                MOE_CACHE_DBG("[moe-cache-dbg] gate-dst blk=%d %p\n", g.cur_blk, (const void *)dbase);
             } else {
                 g.learn_up_dst[g.cur_blk] = dbase;
             }
@@ -1251,12 +1259,12 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
                     f.mask |= 1ull << k;
                 }
                 const size_t bytes = (size_t)d.out_rows * n_out * sizeof(float);
-                ec3_ok(di, cudaMemcpyAsync(d.h_out, d.d_out, bytes, cudaMemcpyDeviceToHost, d.compute_stream), "fused D2H");
+                moe_cache_ok(di, cudaMemcpyAsync(d.h_out, d.d_out, bytes, cudaMemcpyDeviceToHost, d.compute_stream), "fused D2H");
                 d.out_rows = 0;
                 d.q8_act_ptr = nullptr;
                 d.fused_layers++;
                 d.t_coll_us += ggml_time_us() - t0;
-                if (g.stats_every > 0 && ++g.collect_calls % g.stats_every == 0) ec3_stats();
+                if (g.stats_every > 0 && ++g.collect_calls % g.stats_every == 0) moe_cache_stats();
                 return;
             }
             if (g.cur_role == 1) {
@@ -1276,7 +1284,7 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
     // scatter + thread-0 sync entirely. CPU miss rows are uploaded later in
     // redirect_finalize (after the node barrier, when they are complete).
     if (g.redirect_on && g.cur_n_tokens == 1 && g.cur_role == 2 && n_hits > 0 && n_hits <= 64) {
-        ec3_global::redirect_entry * re = nullptr;
+        moe_cache_global::redirect_entry * re = nullptr;
         const void * base = nullptr;
         for (auto & kv : g.redirect) {
             const char * b = (const char *)kv.first;
@@ -1297,26 +1305,26 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
             if (d.h_redir_half < img_cap) {
                 if (d.h_redir) cudaFreeHost(d.h_redir);
                 d.h_redir = nullptr;
-                rok = ec3_ok(di, cudaMallocHost((void **)&d.h_redir, 2 * img_cap), "redirect image alloc");
+                rok = moe_cache_ok(di, cudaMallocHost((void **)&d.h_redir, 2 * img_cap), "redirect image alloc");
                 d.h_redir_half = rok ? img_cap : 0;
             }
             d.redir_par ^= 1;
             const int par = d.redir_par;
             char * img = d.h_redir + (size_t)par * d.h_redir_half;
             if (rok && !d.redir_evt[par]) {
-                rok = ec3_ok(di, cudaEventCreateWithFlags(&d.redir_evt[par], cudaEventDisableTiming), "redirect event create");
+                rok = moe_cache_ok(di, cudaEventCreateWithFlags(&d.redir_evt[par], cudaEventDisableTiming), "redirect event create");
             }
             uint64_t mask = 0;
             for (int i = 0; rok && i < n_hits; i++) {
                 const int ridx = (int)(((const char *)dst_rows[i] - (const char *)base) / re->nb1);
                 mask |= 1ull << ridx;
-                rok = ec3_ok(di, cudaMemcpyAsync(img + (size_t)ridx * re->nb1,
+                rok = moe_cache_ok(di, cudaMemcpyAsync(img + (size_t)ridx * re->nb1,
                                            d.d_out + (size_t)i * n_out,
                                            n_out * sizeof(float),
                                            cudaMemcpyDeviceToHost, d.compute_stream), "redirect D2H");
             }
             if (rok) {
-                rok = ec3_ok(di, cudaEventRecord(d.redir_evt[par], d.compute_stream), "redirect event record");
+                rok = moe_cache_ok(di, cudaEventRecord(d.redir_evt[par], d.compute_stream), "redirect event record");
             }
             if (!rok) {
                 // degraded: ship finite zeros via the scheduler's normal copy
@@ -1328,17 +1336,17 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
             re->par       = par;
             d.out_rows = 0;
             d.t_coll_us += ggml_time_us() - t0;
-            if (g.stats_every > 0 && ++g.collect_calls % g.stats_every == 0) ec3_stats();
+            if (g.stats_every > 0 && ++g.collect_calls % g.stats_every == 0) moe_cache_stats();
             return;
         }
     }
 
-    EC3_DBG("[ec3-dbg] collect dev=%d rows=%d pre-sync\n", di, d.out_rows);
+    MOE_CACHE_DBG("[moe-cache-dbg] collect dev=%d rows=%d pre-sync\n", di, d.out_rows);
     const size_t bytes = (size_t)d.out_rows * n_out * sizeof(float);
     const bool cok = !d.dead && d.h_out && d.d_out
-        && ec3_ok(di, cudaMemcpyAsync(d.h_out, d.d_out, bytes, cudaMemcpyDeviceToHost, d.compute_stream), "collect D2H")
-        && ec3_ok(di, cudaStreamSynchronize(d.compute_stream), "collect sync");
-    EC3_DBG("[ec3-dbg] collect dev=%d post-sync\n", di);
+        && moe_cache_ok(di, cudaMemcpyAsync(d.h_out, d.d_out, bytes, cudaMemcpyDeviceToHost, d.compute_stream), "collect D2H")
+        && moe_cache_ok(di, cudaStreamSynchronize(d.compute_stream), "collect sync");
+    MOE_CACHE_DBG("[moe-cache-dbg] collect dev=%d post-sync\n", di);
     for (int i = 0; i < n_hits; i++) {
         if (cok) memcpy(dst_rows[i], d.h_out + (size_t)i * n_out, n_out * sizeof(float));
         else     memset(dst_rows[i], 0, n_out * sizeof(float));
@@ -1348,31 +1356,31 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
     d.t_coll_us += ggml_time_us() - t0;
 
     if (g.stats_every > 0 && ++g.collect_calls % g.stats_every == 0) {
-        ec3_stats();
+        moe_cache_stats();
     }
 }
 
 // ---- API: GPU-resident dst handoff ----------------------------------------------------
 
-static void ec3_redirect_offer(const void * host_dst_data, size_t nb1, int64_t n_rows,
+static void moe_cache_redirect_offer(const void * host_dst_data, size_t nb1, int64_t n_rows,
                                void * gpu_copy_data, void * consumer_backend) {
     GGML_UNUSED(consumer_backend);
     if (!g.redirect_on || n_rows > 64) return;
-    ec3_global::redirect_entry re;
+    moe_cache_global::redirect_entry re;
     re.nb1     = nb1;
     re.n_rows  = n_rows;
     re.gpu_ptr = gpu_copy_data;
     g.redirect[host_dst_data] = re;
 }
 
-static int ec3_redirect_finalize(const void * host_dst_data, void * consumer_backend) {
+static int moe_cache_redirect_finalize(const void * host_dst_data, void * consumer_backend) {
     auto it = g.redirect.find(host_dst_data);
     if (it == g.redirect.end()) return 0;
-    ec3_global::redirect_entry re = it->second;
+    moe_cache_global::redirect_entry re = it->second;
     g.redirect.erase(it);
     if (!re.populated || re.dev < 0) return 0;
 
-    ec3_device & d = g.dev[re.dev];
+    moe_cache_device & d = g.dev[re.dev];
     char * img = d.h_redir + (size_t)re.par * d.h_redir_half;
 
     // fill the miss rows into the pinned image (the node barrier has passed:
@@ -1389,8 +1397,8 @@ static int ec3_redirect_finalize(const void * host_dst_data, void * consumer_bac
     ggml_backend_t be = (ggml_backend_t)consumer_backend;
     ggml_backend_cuda_context * cc = (ggml_backend_cuda_context *)be->context;
     ggml_cuda_set_device(cc->device);
-    if (!ec3_ok(re.dev, cudaStreamWaitEvent(cc->stream(), d.redir_evt[re.par], 0), "redirect wait") ||
-        !ec3_ok(re.dev, cudaMemcpyAsync(re.gpu_ptr, img, (size_t)re.n_rows * re.nb1,
+    if (!moe_cache_ok(re.dev, cudaStreamWaitEvent(cc->stream(), d.redir_evt[re.par], 0), "redirect wait") ||
+        !moe_cache_ok(re.dev, cudaMemcpyAsync(re.gpu_ptr, img, (size_t)re.n_rows * re.nb1,
                                cudaMemcpyHostToDevice, cc->stream()), "redirect H2D")) {
         return 0;   // scheduler performs its normal copy from the host dst
     }
@@ -1401,20 +1409,20 @@ static int ec3_redirect_finalize(const void * host_dst_data, void * consumer_bac
 
 // ---- API: fused GLU hook ---------------------------------------------------------------
 
-static unsigned long long ec3_glu_hits(const void * src0_data, const void * src1_data,
+static unsigned long long moe_cache_glu_hits(const void * src0_data, const void * src1_data,
                                        void * dst_data, size_t dst_nb1, int ith) {
     // learning: observing the GLU node whose inputs are a layer's gate/up MMID
     // dsts proves the fused dispatch is safe for that layer
     if (!g.fuse) return 0;
     if (ith == 0) {
-        EC3_DBG("[ec3-dbg] glu call src0=%p src1=%p\n", src0_data, src1_data);
+        MOE_CACHE_DBG("[moe-cache-dbg] glu call src0=%p src1=%p\n", src0_data, src1_data);
     }
     auto lit = g.glu_learn.find(src0_data);
     if (lit == g.glu_learn.end()) return 0;
     const int blk = lit->second;
     if (blk >= 0 && blk < 1024 && g.learn_up_dst[blk] == src1_data && !g.safe_fuse_blk[blk]) {
         g.safe_fuse_blk[blk] = true;
-        EC3_DBG("[ec3-dbg] fuse-safe blk=%d\n", blk);
+        MOE_CACHE_DBG("[moe-cache-dbg] fuse-safe blk=%d\n", blk);
     }
 
     // active fused rows for this pair? dst buffers are reused across layers,
@@ -1431,10 +1439,10 @@ static unsigned long long ec3_glu_hits(const void * src0_data, const void * src1
         if (di < 0) return 0;
         auto & f = g.dev[di].fused;
         if (ith == 0 && !f.scattered) {
-            ec3_device & d = g.dev[di];
+            moe_cache_device & d = g.dev[di];
             ggml_cuda_set_device(di);
             const bool gok = !d.dead &&
-                ec3_ok(di, cudaStreamSynchronize(d.compute_stream), "glu sync");   // D2H of fused rows
+                moe_cache_ok(di, cudaStreamSynchronize(d.compute_stream), "glu sync");   // D2H of fused rows
             for (int i = 0; i < f.n; i++) {
                 char * row = (char *)dst_data + (size_t)f.rows[i] * dst_nb1;
                 if (gok) memcpy(row, d.h_out + (size_t)i * f.n_out, f.n_out * sizeof(float));
@@ -1452,9 +1460,9 @@ static unsigned long long ec3_glu_hits(const void * src0_data, const void * src1
 // scratch buffer on the device and marks its cache dead (conservative: the
 // budget decision was clearly wrong for this workload). Returns bytes freed.
 
-extern "C" size_t ggml_expert_cache_v3_trim(int device) {
+extern "C" size_t ggml_moe_cache_trim(int device) {
     if (!g.enabled || device < 0 || device >= g.n_dev) return 0;
-    ec3_device & d = g.dev[device];
+    moe_cache_device & d = g.dev[device];
     if (d.n_pools == 0 && !d.d_out) return 0;
 
     std::unique_lock<std::mutex> lk(g.mu);
@@ -1469,7 +1477,7 @@ extern "C" size_t ggml_expert_cache_v3_trim(int device) {
     cudaSetDevice(device);
     size_t freed = 0;
     for (int i = 0; i < d.n_pools; i++) {
-        ec3_pool & p = d.pools[i];
+        moe_cache_pool & p = d.pools[i];
         if (p.slab)  { freed += (size_t)p.n_slots * p.expert_size; cudaFree(p.slab);  p.slab  = nullptr; }
         if (p.slab2) { freed += (size_t)p.n_slots * p.expert_size; cudaFree(p.slab2); p.slab2 = nullptr; }
         p.map.clear();
@@ -1486,7 +1494,7 @@ extern "C" size_t ggml_expert_cache_v3_trim(int device) {
     memset(g.resident_pair, 0, sizeof(g.resident_pair));
     memset(g.resident_down, 0, sizeof(g.resident_down));
     d.dead = true;
-    EC3_LOG("[ec3] dev=%d TRIMMED %zu MB under VRAM pressure — cache off on this device\n",
+    MOE_CACHE_LOG("[moe-cache] dev=%d TRIMMED %zu MB under VRAM pressure — cache off on this device\n",
             device, freed >> 20);
     return freed;
 }
@@ -1499,7 +1507,7 @@ extern "C" size_t ggml_expert_cache_v3_trim(int device) {
 // Cached slots become unreachable automatically (keys mix the host base) and
 // are reclaimed by LRU.
 
-static void ec3_invalidate(const void * base, size_t size) {
+static void moe_cache_invalidate(const void * base, size_t size) {
     if (!g.enabled) return;
     const char * lo = (const char *)base;
     const char * hi = lo + size;
@@ -1532,7 +1540,7 @@ static void ec3_invalidate(const void * base, size_t size) {
 
 // ---- API: node wall-time samples (bail-out) ---------------------------------------------
 
-static void ec3_node_time(int code, int64_t us) {
+static void moe_cache_node_time(int code, int64_t us) {
     if (g.bail.tripped) return;
     auto & b = g.bail;
     if (code == -3) {
@@ -1548,11 +1556,11 @@ static void ec3_node_time(int code, int64_t us) {
     if (b.on_ewma > b.base_ewma * 1.05) {
         if (++b.strikes >= 4) {
             b.tripped = true;
-            EC3_LOG("[ec3] bail-out: cache-engaged nodes average %.0fus vs %.0fus pure-CPU — "
+            MOE_CACHE_LOG("[moe-cache] bail-out: cache-engaged nodes average %.0fus vs %.0fus pure-CPU — "
                     "disabling the cache and freeing its VRAM for this run\n",
                     b.on_ewma, b.base_ewma);
             for (int di = 0; di < g.n_dev; di++) {
-                ggml_expert_cache_v3_trim(di);
+                ggml_moe_cache_trim(di);
             }
             g.enabled = false;
         }
@@ -1563,37 +1571,37 @@ static void ec3_node_time(int code, int64_t us) {
 
 // ---- API: stats ----------------------------------------------------------------------
 
-static void ec3_stats(void) {
+static void moe_cache_stats(void) {
     for (int i = 0; i < g.n_dev; i++) {
-        ec3_device & d = g.dev[i];
+        moe_cache_device & d = g.dev[i];
         if (!d.compute_stream) continue;
         const long long tot = d.hits + d.misses;
         int used = 0, slots = 0;
         for (int pi = 0; pi < d.n_pools; pi++) { used += d.pools[pi].n_used; slots += d.pools[pi].n_slots; }
-        EC3_LOG("[ec3] dev=%d hits=%lld/%lld (%.1f%%) inserts=%lld evict=%lld skip=%lld queued-miss=%lld used=%d/%d q=%zu\n",
+        MOE_CACHE_LOG("[moe-cache] dev=%d hits=%lld/%lld (%.1f%%) inserts=%lld evict=%lld skip=%lld queued-miss=%lld used=%d/%d q=%zu\n",
                 i, d.hits, tot, tot ? 100.0 * d.hits / tot : 0.0,
                 d.inserts, d.evictions, d.insert_skips, d.queued_misses,
                 used, slots, g.queue.size());
-        EC3_LOG("[ec3] dev=%d decomp: compulsory=%lld capacity=%lld admission=%lld inflight=%lld uniq-seen=%zu uniq-inserted=%zu | skips: throttle=%lld budget=%lld qfull=%lld lru=%lld\n",
+        MOE_CACHE_LOG("[moe-cache] dev=%d decomp: compulsory=%lld capacity=%lld admission=%lld inflight=%lld uniq-seen=%zu uniq-inserted=%zu | skips: throttle=%lld budget=%lld qfull=%lld lru=%lld\n",
                 i, d.miss_compulsory, d.miss_capacity, d.miss_admission, d.queued_misses,
                 d.ever_seen.size(), d.ever_inserted.size(),
                 d.skip_throttle, d.skip_budget, d.skip_qfull, d.skip_lrubusy);
         for (int pi = 0; pi < d.n_pools; pi++) {
             const long long ptot = d.pool_hits[pi] + d.pool_miss[pi];
-            EC3_LOG("[ec3] dev=%d pool[%d]: hits=%lld/%lld (%.1f%%) slots=%d slot=%zuKB\n",
+            MOE_CACHE_LOG("[moe-cache] dev=%d pool[%d]: hits=%lld/%lld (%.1f%%) slots=%d slot=%zuKB\n",
                     i, pi, d.pool_hits[pi], ptot, ptot ? 100.0 * d.pool_hits[pi] / ptot : 0.0,
                     d.pools[pi].n_slots, d.pools[pi].expert_size >> 10);
         }
         if (d.n_nodes > 0) {
-            EC3_LOG("[ec3] dev=%d timing: nodes=%lld plan=%.1fus disp=%.1fus coll=%.1fus per-node total=%.1fus\n",
+            MOE_CACHE_LOG("[moe-cache] dev=%d timing: nodes=%lld plan=%.1fus disp=%.1fus coll=%.1fus per-node total=%.1fus\n",
                     i, d.n_nodes,
                     (double)d.t_plan_us / d.n_nodes, (double)d.t_disp_us / d.n_nodes,
                     (double)d.t_coll_us / d.n_nodes,
                     (double)(d.t_plan_us + d.t_disp_us + d.t_coll_us) / d.n_nodes);
-            EC3_LOG("[ec3] dev=%d redirect: claims=%lld miss-rows-up=%lld fused-layers=%lld\n",
+            MOE_CACHE_LOG("[moe-cache] dev=%d redirect: claims=%lld miss-rows-up=%lld fused-layers=%lld\n",
                     i, d.redirect_claims, d.redirect_misses_up, d.fused_layers);
             if (i == 0) {
-                EC3_LOG("[ec3] bail-ewma: base=%.1fus(n=%lld) on=%.1fus(n=%lld)\n",
+                MOE_CACHE_LOG("[moe-cache] bail-ewma: base=%.1fus(n=%lld) on=%.1fus(n=%lld)\n",
                         g.bail.base_ewma, g.bail.base_n, g.bail.on_ewma, g.bail.on_n);
             }
         }
@@ -1602,12 +1610,12 @@ static void ec3_stats(void) {
 
 // ---- self-test ---------------------------------------------------------------------------
 //
-// LLAMA_EC3_SELFTEST=1 runs at registration: builds a synthetic quantized pool,
+// GGML_CUDA_MOE_CACHE_SELFTEST=1 runs at registration: builds a synthetic quantized pool,
 // runs the full plan-free dispatch+collect path, and compares against a host
 // reference matvec on dequantized weights. No model required — this validates
 // the batched mmvq stride mapping and the staging logic in seconds.
 
-static bool ec3_selftest_one(int di, ggml_type wtype, int64_t n_in, int64_t n_out,
+static bool moe_cache_selftest_one(int di, ggml_type wtype, int64_t n_in, int64_t n_out,
                              int n_hits, bool shared_act) {
     const int n_slots = 16;
     const size_t row_bytes  = ggml_row_size(wtype, n_in);
@@ -1629,11 +1637,11 @@ static bool ec3_selftest_one(int di, ggml_type wtype, int64_t n_in, int64_t n_ou
     CUDA_CHECK(cudaMemcpy(d_pool, wq.data(), wq.size(), cudaMemcpyHostToDevice));
 
     // fabricate device + pool state
-    ec3_device & d = g.dev[di];
+    moe_cache_device & d = g.dev[di];
     if (!d.compute_stream) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&d.compute_stream, cudaStreamNonBlocking));
     }
-    ec3_pool & p = d.pools[0];
+    moe_cache_pool & p = d.pools[0];
     p.expert_size = slot_bytes;
     p.wtype = wtype;
     p.slab = d_pool;
@@ -1651,12 +1659,12 @@ static bool ec3_selftest_one(int di, ggml_type wtype, int64_t n_in, int64_t n_ou
         act_rows[i] = shared_act ? act.data() : act.data() + (size_t)i * n_in;
     }
 
-    ec3_dispatch(di, (int)wtype, n_in, n_out, n_hits, slot_ids, act_rows);
+    moe_cache_dispatch(di, (int)wtype, n_in, n_out, n_hits, slot_ids, act_rows);
 
     std::vector<float> out((size_t)n_hits * n_out, -12345.0f);
     float * out_rows[64];
     for (int i = 0; i < n_hits; i++) out_rows[i] = out.data() + (size_t)i * n_out;
-    ec3_collect(di, n_hits, out_rows, n_out);
+    moe_cache_collect(di, n_hits, out_rows, n_out);
 
     // host reference: dequantize slot rows, dot with fp32 act (mmvq quantizes the
     // activation to q8_1, so allow a tolerance)
@@ -1681,41 +1689,41 @@ static bool ec3_selftest_one(int di, ggml_type wtype, int64_t n_in, int64_t n_ou
     const int reps = 200;
     int64_t t0 = ggml_time_us();
     for (int r = 0; r < reps; r++) {
-        ec3_dispatch(di, (int)wtype, n_in, n_out, n_hits, slot_ids, act_rows);
-        ec3_collect(di, n_hits, out_rows, n_out);
+        moe_cache_dispatch(di, (int)wtype, n_in, n_out, n_hits, slot_ids, act_rows);
+        moe_cache_collect(di, n_hits, out_rows, n_out);
     }
     const double us_per_node = (double)(ggml_time_us() - t0) / reps;
 
     // tolerance: mmvq quantizes the activation to q8_1 while the reference uses
     // fp32, so a few percent of relative error on near-zero outputs is expected
     const bool ok = max_rel < 0.10;
-    EC3_LOG("[ec3-selftest] dev=%d type=%s n_in=%lld n_out=%lld hits=%d %s: max_rel=%.4f %s | %.1f us/node\n",
+    MOE_CACHE_LOG("[moe-cache-selftest] dev=%d type=%s n_in=%lld n_out=%lld hits=%d %s: max_rel=%.4f %s | %.1f us/node\n",
             di, ggml_type_name(wtype), (long long)n_in, (long long)n_out, n_hits,
             shared_act ? "shared-act" : "multi-act", max_rel, ok ? "OK" : "FAIL", us_per_node);
 
     cudaFree(d_pool);
-    p = ec3_pool{};
+    p = moe_cache_pool{};
     return ok;
 }
 
-static void ec3_selftest(void) {
+static void moe_cache_selftest(void) {
     bool all = true;
-    all &= ec3_selftest_one(0, GGML_TYPE_Q4_K, 2048, 768,  8, true);
-    all &= ec3_selftest_one(0, GGML_TYPE_Q4_K, 768,  2048, 8, false);
-    all &= ec3_selftest_one(0, GGML_TYPE_Q4_K, 2048, 768,  1, true);
-    all &= ec3_selftest_one(0, GGML_TYPE_Q6_K, 2048, 768,  5, true);
-    all &= ec3_selftest_one(0, GGML_TYPE_Q6_K, 512,  2048, 8, false);
-    EC3_LOG("[ec3-selftest] %s\n", all ? "ALL PASS" : "FAILURES PRESENT");
+    all &= moe_cache_selftest_one(0, GGML_TYPE_Q4_K, 2048, 768,  8, true);
+    all &= moe_cache_selftest_one(0, GGML_TYPE_Q4_K, 768,  2048, 8, false);
+    all &= moe_cache_selftest_one(0, GGML_TYPE_Q4_K, 2048, 768,  1, true);
+    all &= moe_cache_selftest_one(0, GGML_TYPE_Q6_K, 2048, 768,  5, true);
+    all &= moe_cache_selftest_one(0, GGML_TYPE_Q6_K, 512,  2048, 8, false);
+    MOE_CACHE_LOG("[moe-cache-selftest] %s\n", all ? "ALL PASS" : "FAILURES PRESENT");
 }
 
 // ---- registration ----------------------------------------------------------------------
 
-void ggml_expert_cache_v3_register(void) {
+void ggml_moe_cache_register(void) {
     // always-on auto mode: active unless explicitly disabled. Engagement is
     // still gated per model (expert size, type allowlist, census) and a
     // baseline-sampled bail-out disables the cache if it ever measures itself
     // losing on this workload.
-    const char * v = getenv("LLAMA_EC3");
+    const char * v = getenv("GGML_CUDA_MOE_CACHE");
     g.enabled = !(v && atoi(v) <= 0);
     if (!g.enabled) return;
 
@@ -1723,41 +1731,41 @@ void ggml_expert_cache_v3_register(void) {
     cudaGetDeviceCount(&dev_count);
     if (dev_count <= 0) { g.enabled = false; return; }
 
-    g.n_dev = dev_count > EC3_MAX_DEV ? EC3_MAX_DEV : dev_count;
-    if (const char * e = getenv("LLAMA_EC3_NDEV"))      { int n = atoi(e); if (n > 0 && n < g.n_dev) g.n_dev = n; }
-    if (const char * e = getenv("LLAMA_EC3_BUDGET_MB")) g.budget_mb = (size_t)atoll(e);
-    if (const char * e = getenv("LLAMA_EC3_INSERTS"))   g.inserts_per_plan = atoi(e);
-    if (const char * e = getenv("LLAMA_EC3_THROTTLE"))  { g.throttle_mod = atoi(e); if (g.throttle_mod < 1) g.throttle_mod = 1; }
-    if (const char * e = getenv("LLAMA_EC3_WORKERS"))   { int n = atoi(e); if (n > 0 && n <= 16) g.n_workers = n; }
-    if (const char * e = getenv("LLAMA_EC3_STATS"))     g.stats_every = atoi(e);
-    if (const char * e = getenv("LLAMA_EC3_MIN_EXPERT_KB")) g.min_expert_bytes = (size_t)atoll(e) << 10;
-    if (const char * e = getenv("LLAMA_EC3_RESERVE_MB"))    g.reserve_mb = (size_t)atoll(e);
-    if (const char * e = getenv("LLAMA_EC3_REUSE"))         g.reuse = atoi(e) > 0;
-    if (const char * e = getenv("LLAMA_EC3_FUSE"))          g.fuse = atoi(e) > 0;
-    if (const char * e = getenv("LLAMA_EC3_MAX_BATCH"))     { int n = atoi(e); if (n >= 1 && n <= 8) g.max_batch = n; }
-    if (const char * e = getenv("LLAMA_EC3_PREFETCH"))      g.backfill.enabled = atoi(e) > 0;
-    if (const char * e = getenv("LLAMA_EC3_HOTSET"))        g.hotset_enabled = atoi(e) > 0;
+    g.n_dev = dev_count > MOE_CACHE_MAX_DEV ? MOE_CACHE_MAX_DEV : dev_count;
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_NDEV"))      { int n = atoi(e); if (n > 0 && n < g.n_dev) g.n_dev = n; }
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_BUDGET_MB")) g.budget_mb = (size_t)atoll(e);
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_INSERTS"))   g.inserts_per_plan = atoi(e);
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_THROTTLE"))  { g.throttle_mod = atoi(e); if (g.throttle_mod < 1) g.throttle_mod = 1; }
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_WORKERS"))   { int n = atoi(e); if (n > 0 && n <= 16) g.n_workers = n; }
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_STATS"))     g.stats_every = atoi(e);
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB")) g.min_expert_bytes = (size_t)atoll(e) << 10;
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_RESERVE_MB"))    g.reserve_mb = (size_t)atoll(e);
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_REUSE"))         g.reuse = atoi(e) > 0;
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_FUSE"))          g.fuse = atoi(e) > 0;
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_MAX_BATCH"))     { int n = atoi(e); if (n >= 1 && n <= 8) g.max_batch = n; }
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_PREFETCH"))      g.backfill.enabled = atoi(e) > 0;
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_HOTSET"))        g.hotset_enabled = atoi(e) > 0;
     g.hotset_last_save = ggml_time_us();   // first save no sooner than one period in
     memset(g.blk_pair_pool, -1, sizeof(g.blk_pair_pool));
     memset(g.blk_down_pool, -1, sizeof(g.blk_down_pool));
 
-    ggml_expert_cache_v3.begin    = ec3_begin;
-    ggml_expert_cache_v3.plan     = ec3_plan;
-    ggml_expert_cache_v3.dispatch = ec3_dispatch;
-    ggml_expert_cache_v3.collect  = ec3_collect;
-    ggml_expert_cache_v3.stats    = ec3_stats;
-    ggml_expert_cache_v3.redirect_offer    = ec3_redirect_offer;
-    ggml_expert_cache_v3.redirect_finalize = ec3_redirect_finalize;
-    ggml_expert_cache_v3.glu_hits          = ec3_glu_hits;
-    ggml_expert_cache_v3.invalidate        = ec3_invalidate;
-    ggml_expert_cache_v3.node_time         = ec3_node_time;
-    if (const char * e = getenv("LLAMA_EC3_REDIRECT")) g.redirect_on = atoi(e) > 0;
+    ggml_moe_cache.begin    = moe_cache_begin;
+    ggml_moe_cache.plan     = moe_cache_plan;
+    ggml_moe_cache.dispatch = moe_cache_dispatch;
+    ggml_moe_cache.collect  = moe_cache_collect;
+    ggml_moe_cache.stats    = moe_cache_stats;
+    ggml_moe_cache.redirect_offer    = moe_cache_redirect_offer;
+    ggml_moe_cache.redirect_finalize = moe_cache_redirect_finalize;
+    ggml_moe_cache.glu_hits          = moe_cache_glu_hits;
+    ggml_moe_cache.invalidate        = moe_cache_invalidate;
+    ggml_moe_cache.node_time         = moe_cache_node_time;
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_REDIRECT")) g.redirect_on = atoi(e) > 0;
 
-    EC3_LOG("[ec3] enabled: n_dev=%d budget=%s inserts/plan=%d workers=%d stats_every=%d\n",
+    MOE_CACHE_LOG("[moe-cache] enabled: n_dev=%d budget=%s inserts/plan=%d workers=%d stats_every=%d\n",
             g.n_dev, g.budget_mb ? "env" : "auto-70%-free", g.inserts_per_plan,
             g.n_workers, g.stats_every);
 
-    if (const char * e = getenv("LLAMA_EC3_SELFTEST"); e && atoi(e) > 0) {
-        ec3_selftest();
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_SELFTEST"); e && atoi(e) > 0) {
+        moe_cache_selftest();
     }
 }

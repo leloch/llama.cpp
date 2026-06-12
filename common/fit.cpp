@@ -154,7 +154,7 @@ std::vector<llama_device_memory_data> common_get_device_memory_data(
     return ret;
 }
 
-// Expert cache (EC3) placement preference: when a MoE model's experts cannot
+// MoE expert cache placement preference: when a MoE model's experts cannot
 // all return to VRAM anyway, leaving ALL of them on the CPU and giving the
 // spare VRAM to the dynamic expert cache measures faster than any static
 // partial placement (754B: 19.2 vs 14.0 t/s; 397B: 33.3 vs 28.2). Only models
@@ -162,7 +162,7 @@ std::vector<llama_device_memory_data> common_get_device_memory_data(
 // dormant and a static placement is strictly better.
 // scan one gguf file for a routed-expert tensor; returns -1 if none found,
 // else per-expert KiB (needs n_expert > 0)
-static long common_ec3_expert_kib_in_file(const char * path, int64_t n_expert) {
+static long common_moe_cache_expert_kib_in_file(const char * path, int64_t n_expert) {
     struct gguf_init_params ip = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
     struct gguf_context * gctx = gguf_init_from_file(path, ip);
     if (!gctx) return -1;
@@ -180,11 +180,11 @@ static long common_ec3_expert_kib_in_file(const char * path, int64_t n_expert) {
     return kib;
 }
 
-static bool common_ec3_prefers_cpu_moe(const char * path_model, size_t usable_vram, size_t n_devices) {
-    const char * e = getenv("LLAMA_EC3");
+static bool common_moe_cache_prefers_cpu_moe(const char * path_model, size_t usable_vram, size_t n_devices) {
+    const char * e = getenv("GGML_CUDA_MOE_CACHE");
     if (e && atoi(e) == 0) return false;            // explicitly off
     long min_kb = 256;
-    if (const char * m = getenv("LLAMA_EC3_MIN_EXPERT_KB")) min_kb = atol(m);
+    if (const char * m = getenv("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB")) min_kb = atol(m);
 
     // expert count from part-1 metadata
     int64_t n_expert = 0;
@@ -202,7 +202,7 @@ static bool common_ec3_prefers_cpu_moe(const char * path_model, size_t usable_vr
     }
     if (n_expert <= 0) return false;
 
-    long kib = common_ec3_expert_kib_in_file(path_model, n_expert);
+    long kib = common_moe_cache_expert_kib_in_file(path_model, n_expert);
     size_t model_bytes = 0;
     {
         // total bytes across split parts (placement economics needs the ratio)
@@ -219,14 +219,14 @@ static bool common_ec3_prefers_cpu_moe(const char * path_model, size_t usable_vr
             struct stat st;
             if (stat(p.c_str(), &st) == 0) model_bytes += (size_t)st.st_size;
             if (kib < 0 && part >= 2) {
-                kib = common_ec3_expert_kib_in_file(p.c_str(), n_expert);
+                kib = common_moe_cache_expert_kib_in_file(p.c_str(), n_expert);
             }
         }
     }
     if (kib < min_kb) return false;
 
     // Placement economics, calibrated on 6 measured configs (see
-    // EC3_READINESS.md + matrix): the dynamic cache beats a static partial
+    // MOE_CACHE_READINESS.md + matrix): the dynamic cache beats a static partial
     // placement only for LARGE spills (static could fit < ~55% of the model),
     // and on few devices only with big experts (per-device dispatch-chain
     // serialization: 122B/MiniMax on one 3090 lose 6-18%, 4x 3090 wins).
@@ -861,10 +861,10 @@ static void common_params_fit_impl(
         for (size_t id = 0; id < nd; id++) {
             usable_vram += dmds_full[id].free > margins[id] ? dmds_full[id].free - margins[id] : 0;
         }
-        if (n_dense_only > 0 && common_ec3_prefers_cpu_moe(path_model, usable_vram, nd)) {
+        if (n_dense_only > 0 && common_moe_cache_prefers_cpu_moe(path_model, usable_vram, nd)) {
             LOG_INF("%s: experts cannot all fit in VRAM; expert cache active -> "
                     "keeping ALL experts on CPU, spare VRAM goes to the dynamic cache "
-                    "(LLAMA_EC3=0 restores static placement)\n", __func__);
+                    "(GGML_CUDA_MOE_CACHE=0 restores static placement)\n", __func__);
             set_ngl_tensor_split_tbo(ngl_all_cpu_moe, overflow_bufts_cpu_moe, *mparams);
             return;
         }

@@ -12,11 +12,11 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
-#include "ggml-backend-expert-cache.h"
+#include "ggml-backend-moe-cache.h"
 
-// expert cache v3 function table; populated by the CUDA backend at registry
-// init when LLAMA_EC3=1, consumed by the CPU mul_mat_id kernel.
-struct ggml_expert_cache_v3_api ggml_expert_cache_v3 = {};
+// MoE expert cache function table; populated by the CUDA backend at registry
+// init when GGML_CUDA_MOE_CACHE=1, consumed by the CPU mul_mat_id kernel.
+struct ggml_moe_cache_api ggml_moe_cache = {};
 
 #include <assert.h>
 #include <limits.h>
@@ -114,12 +114,12 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
         return;
     }
 
-    // expert-cache v3: host weight buffers can back queued cache-fill jobs;
+    // MoE expert cache: host weight buffers can back queued cache-fill jobs;
     // notify before the memory goes away (no-op when the cache is inactive)
-    if (ggml_expert_cache_v3.invalidate && buffer->iface.get_base && ggml_backend_buffer_is_host(buffer)) {
+    if (ggml_moe_cache.invalidate && buffer->iface.get_base && ggml_backend_buffer_is_host(buffer)) {
         void * base = ggml_backend_buffer_get_base(buffer);
         if (base) {
-            ggml_expert_cache_v3.invalidate(base, ggml_backend_buffer_get_size(buffer));
+            ggml_moe_cache.invalidate(base, ggml_backend_buffer_get_size(buffer));
         }
     }
 
@@ -1560,24 +1560,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
-    // expert-cache v3 diagnostics: one-shot dump of the split schedule
-    static int ec3_splitdump = -1;
-    if (ec3_splitdump < 0) {
-        const char * e = getenv("LLAMA_EC3_SPLITDUMP");
-        ec3_splitdump = e ? atoi(e) : 0;
-    }
-    if (ec3_splitdump > 0) {
-        ec3_splitdump--;
-        for (int i = 0; i < sched->n_splits; i++) {
-            struct ggml_backend_sched_split * sp = &splits[i];
-            fprintf(stderr, "[split %3d] %-8s n_nodes=%-3d n_inputs=%-2d first='%s' last='%s'\n",
-                    i, ggml_backend_name(sched->backends[sp->backend_id]),
-                    sp->graph.n_nodes, sp->n_inputs,
-                    sp->graph.n_nodes > 0 ? sp->graph.nodes[0]->name : "-",
-                    sp->graph.n_nodes > 0 ? sp->graph.nodes[sp->graph.n_nodes-1]->name : "-");
-        }
-    }
-
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -1691,25 +1673,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                     copy_experts(first_id, last_id);
                 } else {
-                    // expert-cache v3 dst handoff: if the cache populated this
+                    // MoE expert cache dst handoff: if the cache populated this
                     // input's GPU copy directly (down-projection rows), skip the
                     // round-trip copy AND the blocking sync — the cache installed
                     // a stream-order dependency on this backend instead.
-                    if (ggml_expert_cache_v3.redirect_finalize &&
-                        ggml_expert_cache_v3.redirect_finalize(input->data, split_backend)) {
+                    if (ggml_moe_cache.redirect_finalize &&
+                        ggml_moe_cache.redirect_finalize(input->data, split_backend)) {
                         continue;
                     }
-
-                    // expert-cache v3 probe: measure the blocking-fallback input
-                    // copies (CPU MoE dst -> GPU) that EC3's GPU-resident handoff
-                    // would eliminate. LLAMA_EC3_SCHEDPROBE=1.
-                    static int ec3_schedprobe = -1;
-                    if (ec3_schedprobe < 0) {
-                        const char * e = getenv("LLAMA_EC3_SCHEDPROBE");
-                        ec3_schedprobe = e ? atoi(e) : 0;
-                    }
-                    const bool probe_this = ec3_schedprobe > 0 && strstr(input->name, "ffn_moe") != NULL;
-                    int64_t pt0 = probe_this ? ggml_time_us() : 0;
 
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
@@ -1722,27 +1693,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                         ggml_backend_tensor_copy(input, input_cpy);
                     }
-
-                    if (probe_this) {
-                        static int64_t probe_us = 0, probe_n = 0;
-                        probe_us += ggml_time_us() - pt0;
-                        if (++probe_n % 2000 == 0) {
-                            fprintf(stderr, "[ec3-schedprobe] ffn_moe input copies: n=%lld avg=%.1fus total=%.1fms\n",
-                                    (long long)probe_n, (double)probe_us / probe_n, probe_us / 1000.0);
-                        }
-                    }
                 }
             }
         }
 
-        // expert-cache v3 dst handoff: before running a CPU split that ends in a
+        // MoE expert cache dst handoff: before running a CPU split that ends in a
         // MUL_MAT_ID, offer the cache the GPU-side copy tensor of that dst so it
         // can scatter its GPU-computed rows directly (skipping the host round
         // trip). Engaged only with a single, unique CUDA consumer and one copy.
         // note: the CPU backend is always the last one (asserted in sched_new);
         // do NOT use ggml_backend_dev_type here — the CUDA implementation calls
         // cudaGetDeviceProperties (~ms per call!) and this runs per split.
-        if (ggml_expert_cache_v3.redirect_offer && sched->n_copies == 1 &&
+        if (ggml_moe_cache.redirect_offer && sched->n_copies == 1 &&
             split->graph.n_nodes > 0 &&
             split_backend_id == sched->n_backends - 1) {
             ggml_tensor * last = split->graph.nodes[split->graph.n_nodes - 1];
@@ -1763,7 +1725,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_tensor * cpy = tensor_copy(last, splits[consumer_split].backend_id, sched->cur_copy);
                     if (cpy && cpy->data && splits[consumer_split].backend_id != sched->n_backends - 1 &&
                         ggml_is_contiguous(last)) {
-                        ggml_expert_cache_v3.redirect_offer(last->data, last->nb[1],
+                        ggml_moe_cache.redirect_offer(last->data, last->nb[1],
                                                             last->ne[1] * last->ne[2],
                                                             cpy->data, cons_backend);
                     }

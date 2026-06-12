@@ -1251,7 +1251,7 @@ void ggml_cuda_op_mul_mat_vec_q(
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
 }
 
-void ggml_cuda_ec3_mmv(
+void ggml_cuda_moe_cache_mmv(
     const void * pool, ggml_type type0, const char * act_q8, const int32_t * ids_dev,
     float * dst_dev, int64_t n_in, int64_t n_out, int64_t n_slots,
     int64_t slot_stride_bytes, int64_t n_hits, int64_t act_rows, cudaStream_t stream,

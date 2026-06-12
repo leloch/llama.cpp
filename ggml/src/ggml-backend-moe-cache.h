@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-// Expert cache v3 — dynamic VRAM cache for MoE expert weights on CPU-resident
+// MoE expert cache — dynamic VRAM cache for MoE expert weights on CPU-resident
 // MUL_MAT_ID. Integration point is the CPU mul_mat_id kernel itself: thread 0
 // dispatches cached expert rows to the GPU while the remaining threads compute
 // the uncached rows, then results are collected into dst before the node ends.
@@ -17,7 +17,7 @@
 extern "C" {
 #endif
 
-struct ggml_expert_cache_v3_api {
+struct ggml_moe_cache_api {
     // Decide whether the cache engages for this MUL_MAT_ID node.
     // Returns the device id to use (>= 0) or -1 to stay on the pure-CPU path.
     // Performs lazy per-device initialization on first use and selects the
@@ -87,8 +87,8 @@ struct ggml_expert_cache_v3_api {
 };
 
 // Zero-initialized in ggml-backend.cpp; populated by the CUDA backend in
-// ggml_backend_cuda_reg() when the cache is enabled (LLAMA_EC3=1).
-extern struct ggml_expert_cache_v3_api ggml_expert_cache_v3;
+// ggml_backend_cuda_reg() when the cache is enabled (GGML_CUDA_MOE_CACHE=1).
+extern struct ggml_moe_cache_api ggml_moe_cache;
 
 #ifdef __cplusplus
 }

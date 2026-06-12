@@ -50,7 +50,6 @@ struct ec3_slot {
     int      next;
     bool     valid;     // contents complete, lookups may hit
     bool     queued;    // insert copy queued or in flight
-    uint32_t nhits;     // popularity counter (tiering experiment)
 };
 
 struct ec3_pool {
@@ -86,19 +85,9 @@ struct ec3_device {
     int32_t * h_ids = nullptr;  int32_t * d_ids = nullptr;  size_t ids_cap = 0;   // count
     float   * h_act = nullptr;  float   * d_act = nullptr;  size_t act_cap = 0;   // bytes
     void    * d_act_q8 = nullptr;                           size_t act_q8_cap = 0;
-    size_t    act_q8_half = 0;   // byte offset of the second staging half
     float   * d_out = nullptr;                              size_t d_out_cap = 0;
     float   * h_out = nullptr;                              size_t h_out_cap = 0; // pinned
     int       out_rows = 0;
-
-    // gate-defer: a gate node's collect is postponed into the same layer's up
-    // node (nothing reads gate's dst between the two MMIDs in build_moe_ffn),
-    // halving stream syncs and overlapping gate GPU work with up CPU work.
-    bool      pending_active = false;
-    int       pending_blk = -1;
-    int       pending_rows = 0;
-    float *   pending_dst[64];
-    int64_t   pending_n_out = 0;
 
     // activation reuse: gate and up of one layer share the same input row
     const float * q8_act_ptr = nullptr;   // host act already quantized on device
@@ -121,17 +110,6 @@ struct ec3_device {
     } fused;
     long long fused_layers = 0;
 
-    // striping economics: fused-chain wall by hit-count bucket (fixed-vs-exec split)
-    int64_t   chain_t0 = 0;
-    int       chain_n  = 0;
-    long long chain_us[5]  = {};
-    long long chain_cnt[5] = {};
-
-    // striping-probe: how much chain latency STICKS OUT past the CPU work
-    long long glusync_us = 0, glusync_n = 0;     // fused-chain wait at the GLU node
-    long long evt_ready = 0, evt_wait_us = 0, evt_wait_n = 0;  // down chain at finalize
-
-
     // stats
     long long hits = 0, misses = 0, inserts = 0, evictions = 0;
     long long insert_skips = 0, queued_misses = 0;
@@ -142,7 +120,6 @@ struct ec3_device {
     std::unordered_set<uint64_t> ever_seen, ever_inserted;
     // per-phase wall time (thread-0 serial cost), microseconds
     long long t_plan_us = 0, t_disp_us = 0, t_coll_us = 0, n_nodes = 0;
-    long long t_coll_role_us[3] = {}, n_coll_role[3] = {};   // gate/up/down split
     long long redirect_claims = 0, redirect_misses_up = 0;
 };
 
@@ -167,7 +144,6 @@ struct ec3_global {
                                  // crashes the model mid-decode (measured)
     int    inserts_per_plan = 8; // max inserts enqueued per plan() call
     int    throttle_mod     = 8; // at capacity admit 1-in-N misses (LLAMA_EC3_THROTTLE)
-    bool   greedy_last      = false; // last pending pool takes all remaining avail
     int    queue_max        = 512;
     int    n_workers        = 4;
     size_t min_expert_bytes = 1u << 20; // skip models whose experts are too small
@@ -211,20 +187,7 @@ struct ec3_global {
     int32_t      cur_slot_idx[64] = {};
     int          cur_n_ids = 0;
     std::unordered_map<const void *, int> glu_learn;  // gate MMID dst base -> blk
-    bool         defer    = false; // LLAMA_EC3_DEFER=1 to enable gate-defer.
-                                   // OFF by default: measured perf-neutral, and the
-                                   // adjacency-learned safety proof does not cover
-                                   // models with readers between the MMIDs
-                                   // (gpt-oss bias add_id, per-expert scales) —
-                                   // see EC3_READINESS.md B2.
     bool         reuse    = true; // LLAMA_EC3_REUSE=0 to disable act-quant reuse
-    bool         stripe   = false; // LLAMA_EC3_STRIPE=1: role-stripe devices (forces defer off)
-
-    // gate-defer safety: defer only on layers where the up node was OBSERVED
-    // to directly follow the gate node (learned during the first decode token,
-    // so exotic graphs / partial GPU placement can never corrupt gate's dst).
-    int  learn_gate_blk = -1;
-    bool safe_defer_blk[1024] = {};
 
     // fused gate+up+GLU path. Pair-fused dispatch engages per layer only after
     // the CPU GLU hook was OBSERVED matching that layer's gate/up dst pair
@@ -238,13 +201,8 @@ struct ec3_global {
     uint64_t     blk_down_kb[1024] = {}; // down key base (name-hash ^ ptr-hash)
     const void * blk_down_base[1024] = {};
 
-    // cache-aware routing bias: per-blk residency bitmaps (pair = gate+up entry
-    // valid; down = down entry valid). The router's selection probs get +strength
-    // on experts that are FULLY resident (pair && down), so near-ties resolve
-    // toward cached experts. Mixing weights stay unbiased (DeepSeek-V3 pattern).
-    float    rbias_strength = 0.0f;      // LLAMA_EC3_RBIAS (0 = off)
-
-    // hot-set persistence: the residency bitmaps are saved periodically and
+    // hot-set persistence: per-blk residency bitmaps (pair = gate+up entry
+    // valid; down = down entry valid) are saved periodically and
     // preloaded as the backfill's FIRST pass on the next run with the same
     // model fingerprint — the cache starts warm with yesterday's hot experts.
     bool     hotset_enabled = true;      // LLAMA_EC3_HOTSET=0 to disable
@@ -256,9 +214,6 @@ struct ec3_global {
     uint64_t resident_pair[1024][4] = {};   // 256 experts / 64 bits
     uint64_t resident_down[1024][4] = {};
 
-    bool oracle_bias = false;            // LLAMA_EC3_ORACLE=1: research knob, replaces
-                                         // missed experts with cached ones (WRONG OUTPUTS;
-                                         // measures the routing-bias speed ceiling)
     bool fuse = true;                    // LLAMA_EC3_FUSE=0 to disable. Stale-entry
                                          // hazard (EC3_READINESS.md B1) closed by
                                          // gate-begin epoch invalidation + up-node
@@ -724,10 +679,7 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
     else if (strstr(name, "_up_exps"))   role = 1;
     else if (strstr(name, "_down_exps")) role = 2;
 
-    // LLAMA_EC3_STRIPE=1: spread the three roles of a layer across devices so
-    // gate/up traffic does not serialize on one device's stream (probe)
-    const int di = g.stripe ? (blk * 3 + (role < 0 ? 0 : role)) % g.n_dev
-                            : blk % g.n_dev;
+    const int di = blk % g.n_dev;
 
     const uint64_t kb = ec3_fnv1a(name);
     ec3_device & d = g.dev[di];
@@ -881,14 +833,6 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
         g.dev[di].fused.active = false;
     }
 
-    // gate-defer safety learning: mark a layer safe when its up node is the
-    // very next cache visit after its gate node
-    if (role == 1 && blk == g.learn_gate_blk && blk >= 0 && blk < 1024) {
-        if (!g.safe_defer_blk[blk]) EC3_DBG("[ec3-dbg] defer-safe blk=%d\n", blk);
-        g.safe_defer_blk[blk] = true;
-    }
-    g.learn_gate_blk = (role == 0) ? blk : -1;
-
     g.cur_blk  = blk;
     g.cur_role = role;
 
@@ -939,38 +883,6 @@ static int ec3_begin(const char * name, const void * host_base, size_t expert_si
     return di;
 }
 
-// scatter kernel for the GPU-resident dst handoff: copy row r of src
-// (contiguous n_out floats per row) into dst at row_idx[r]*nb1 bytes
-static __global__ void ec3_scatter_rows(const float * __restrict__ src,
-                                        char * __restrict__ dst,
-                                        const int32_t * __restrict__ row_idx,
-                                        int64_t n_out, size_t nb1, int n_rows) {
-    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (int64_t)n_rows * n_out) return;
-    const int     r = (int)(i / n_out);
-    const int64_t c = i % n_out;
-    ((float *)(dst + (size_t)row_idx[r] * nb1))[c] = src[(size_t)r * n_out + c];
-}
-
-// flush a deferred gate collect: sync the stream, scatter the pending rows
-static void ec3_flush(int di) {
-    ec3_device & d = g.dev[di];
-    if (!d.pending_active) return;
-    ggml_cuda_set_device(di);
-    const size_t bytes = (size_t)d.out_rows * d.pending_n_out * sizeof(float);
-    const bool fok = !d.dead
-        && ec3_ok(di, cudaMemcpyAsync(d.h_out, d.d_out, bytes, cudaMemcpyDeviceToHost, d.compute_stream), "flush D2H")
-        && ec3_ok(di, cudaStreamSynchronize(d.compute_stream), "flush sync");
-    for (int i = 0; i < d.pending_rows; i++) {
-        if (fok) memcpy(d.pending_dst[i], d.h_out + (size_t)i * d.pending_n_out, d.pending_n_out * sizeof(float));
-        else     memset(d.pending_dst[i], 0, d.pending_n_out * sizeof(float));
-    }
-    d.pending_active = false;
-    d.pending_rows   = 0;
-    d.out_rows       = 0;
-    d.q8_act_ptr     = nullptr;
-}
-
 // ---- API: plan --------------------------------------------------------------------
 
 static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) {
@@ -1018,14 +930,6 @@ static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) 
                 ec3_lru_remove(p, si);
                 ec3_lru_push_back(p, si);
                 slot_idx[k] = si;
-                p.slots[si].nhits++;
-                d.hits++;
-                d.pool_hits[g.cur_pool]++;
-                n_hits++;
-            } else if (g.oracle_bias && p.lru_tail >= 0 && p.slots[p.lru_tail].valid) {
-                // oracle: serve the hottest resident expert instead (speed ceiling probe)
-                slot_idx[k] = p.lru_tail;
-                p.slots[p.lru_tail].nhits++;
                 d.hits++;
                 d.pool_hits[g.cur_pool]++;
                 n_hits++;
@@ -1036,22 +940,6 @@ static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) 
                 d.pool_miss[g.cur_pool]++;
             }
             continue;
-        }
-
-        if (g.oracle_bias && p.n_used > 0) {
-            int si = (int)(key % (uint64_t)p.n_used);
-            for (int t2 = 0; t2 < 8; t2++) {
-                if (p.slots[si].valid) break;
-                si = (si + 1) % p.n_used;
-            }
-            if (p.slots[si].valid) {
-                slot_idx[k] = si;
-                p.slots[si].nhits++;
-                d.hits++;
-                d.pool_hits[g.cur_pool]++;
-                n_hits++;
-                continue;
-            }
         }
 
         d.misses++;
@@ -1107,10 +995,10 @@ static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) 
             if (old.valid || old.queued) {
                 p.map.erase(old.key);
                 d.evictions++;
-                // routing-bias bitmap: this expert is leaving residency. The key
-                // does not encode (blk,eid) reversibly, so clear lazily: a wrong
-                // stale bit only biases toward an expert that then misses (safe,
-                // self-correcting via re-insert or next eviction sweep).
+                // residency bitmap (hot-set persistence): this expert is leaving.
+                // The key does not encode (blk,eid) reversibly, so clear lazily:
+                // a stale bit merely makes the next session's warm backfill load
+                // one expert that is no longer hot (harmless).
             }
             ec3_lru_remove(p, si);
         }
@@ -1144,12 +1032,6 @@ static int ec3_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) 
     // stash the per-position result so collect can reconstruct dst row indices
     g.cur_n_ids = n_ids;
     for (int k = 0; k < n_ids && k < 64; k++) g.cur_slot_idx[k] = slot_idx[k];
-
-    // resolve any deferred gate collect that this node will not absorb
-    // (absorbed only by the same layer's up node when it has hits of its own)
-    if (d.pending_active && !(g.cur_role == 1 && g.cur_blk == d.pending_blk && n_hits > 0)) {
-        ec3_flush(di);
-    }
 
     d.t_plan_us += ggml_time_us() - t0;
     d.n_nodes++;
@@ -1186,19 +1068,16 @@ static void ec3_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_out, int
     }
     const int act_n = shared_act ? 1 : n_hits;
 
-    // grow staging. Host staging (h_ids/h_act) is allocated 2x and used in
-    // halves: with gate-defer, a second dispatch is enqueued while the first
-    // one's async H2D copies may not have executed yet — the DMA engine reads
-    // pinned host memory at stream-execution time, so the staging being
-    // written now must not be the staging still in flight. Device-side
-    // buffers are stream-ordered and safe to reuse.
+    // grow staging (pinned host + device). The stream is synchronized before
+    // the next dispatch reuses these (collect syncs, or the GLU hook syncs on
+    // the fused path), so single-buffered staging is safe.
     if (d.ids_cap < (size_t)n_hits) {
         const size_t cap = n_hits * 2 + 8;
         if (d.h_ids) cudaFreeHost(d.h_ids);
         if (d.d_ids) cudaFree(d.d_ids);
         d.h_ids = nullptr; d.d_ids = nullptr;
-        if (!ec3_ok(di, cudaMallocHost((void **)&d.h_ids, 2 * cap * sizeof(int32_t)), "ids host alloc") ||
-            !ec3_ok(di, cudaMalloc((void **)&d.d_ids, 2 * cap * sizeof(int32_t)), "ids dev alloc")) {
+        if (!ec3_ok(di, cudaMallocHost((void **)&d.h_ids, cap * sizeof(int32_t)), "ids host alloc") ||
+            !ec3_ok(di, cudaMalloc((void **)&d.d_ids, cap * sizeof(int32_t)), "ids dev alloc")) {
             d.out_rows += n_hits;
             return;
         }
@@ -1210,34 +1089,30 @@ static void ec3_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_out, int
         if (d.h_act) cudaFreeHost(d.h_act);
         if (d.d_act) cudaFree(d.d_act);
         d.h_act = nullptr; d.d_act = nullptr;
-        if (!ec3_ok(di, cudaMallocHost((void **)&d.h_act, 2 * cap), "act host alloc") ||
-            !ec3_ok(di, cudaMalloc((void **)&d.d_act, 2 * cap), "act dev alloc")) {
+        if (!ec3_ok(di, cudaMallocHost((void **)&d.h_act, cap), "act host alloc") ||
+            !ec3_ok(di, cudaMalloc((void **)&d.d_act, cap), "act dev alloc")) {
             d.out_rows += n_hits;
             return;
         }
         d.act_cap = cap;
     }
-    const int       half    = d.pending_active ? 1 : 0;
-    int32_t * const h_ids_h = d.h_ids + (size_t)half * d.ids_cap;
-    int32_t * const d_ids_h = d.d_ids + (size_t)half * d.ids_cap;
-    float   * const h_act_h = (float *)((char *)d.h_act + (size_t)half * d.act_cap);
-    float   * const d_act_h = (float *)((char *)d.d_act + (size_t)half * d.act_cap);
+    int32_t * const h_ids_h = d.h_ids;
+    int32_t * const d_ids_h = d.d_ids;
+    float   * const h_act_h = d.h_act;
+    float   * const d_act_h = d.d_act;
     const size_t need_q8 = (size_t)act_n * (n_in_padded / QK8_1) * sizeof(block_q8_1);
     if (d.act_q8_cap < need_q8) {
         const size_t cap = need_q8 * 2;
         if (d.d_act_q8) cudaFree(d.d_act_q8);
         d.d_act_q8 = nullptr;
-        if (!ec3_ok(di, cudaMalloc(&d.d_act_q8, 2 * cap), "q8 alloc")) {
+        if (!ec3_ok(di, cudaMalloc(&d.d_act_q8, cap), "q8 alloc")) {
             d.out_rows += n_hits;
             return;
         }
-        d.act_q8_cap  = cap;
-        d.act_q8_half = cap;
+        d.act_q8_cap = cap;
     }
     const size_t need_out = (size_t)(d.out_rows + n_hits) * n_out * sizeof(float);
     if (d.d_out_cap < need_out) {
-        // reallocating d_out would drop deferred rows still resident there
-        if (d.pending_active) ec3_flush(di);
         const size_t cap = ((size_t)(d.out_rows + n_hits) * n_out * sizeof(float)) * 2 + 65536;
         if (d.d_out) cudaFree(d.d_out);
         d.d_out = nullptr;
@@ -1265,12 +1140,12 @@ static void ec3_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_out, int
     // quantized copy already on the device when possible
     const bool reuse_q8 = g.reuse && act_n == 1 && g.cur_role == 1 &&
                           d.q8_act_ptr == act_rows[0] && d.q8_act_blk == g.cur_blk;
-    const char * act_q8 = (const char *)d.d_act_q8 + (reuse_q8 ? 0 : (size_t)half * d.act_q8_half);
+    const char * act_q8 = (const char *)d.d_act_q8;
     if (!reuse_q8) {
         for (int i = 0; i < act_n; i++) {
             memcpy(h_act_h + (size_t)i * n_in, act_rows[i], n_in * sizeof(float));
         }
-        d.q8_act_ptr = (act_n == 1 && half == 0) ? act_rows[0] : nullptr;
+        d.q8_act_ptr = act_n == 1 ? act_rows[0] : nullptr;
         d.q8_act_blk = g.cur_blk;
     }
 
@@ -1342,38 +1217,6 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
         }
     }
 
-    // gate-defer: postpone this sync into the same layer's up node (only on
-    // layers where up was observed to directly follow gate — see begin())
-    if (g.defer && g.cur_n_tokens == 1 && g.cur_role == 0 && !d.pending_active && n_hits <= 64 &&
-        g.cur_blk >= 0 && g.cur_blk < 1024 && g.safe_defer_blk[g.cur_blk] &&
-        !(g.fuse && g.cur_pool >= 0 && d.pools[g.cur_pool].paired && g.safe_fuse_blk[g.cur_blk])) {
-        d.pending_active = true;
-        d.pending_blk    = g.cur_blk;
-        d.pending_rows   = n_hits;
-        d.pending_n_out  = n_out;
-        memcpy(d.pending_dst, dst_rows, n_hits * sizeof(float *));
-        if (g_dbg > 0) {
-            // poison: detect any reader/writer touching the rows mid-defer
-            for (int i = 0; i < n_hits; i++) dst_rows[i][0] = 1e30f;
-        }
-        // bisection aid: LLAMA_EC3_DEFER_SYNC=1 keeps the bookkeeping but syncs
-        // here anyway — separates bookkeeping bugs from async-interaction bugs
-        static const bool defer_sync = []{ const char * e = getenv("LLAMA_EC3_DEFER_SYNC"); return e && atoi(e) > 0; }();
-        if (defer_sync) {
-            ggml_cuda_set_device(di);
-            CUDA_CHECK(cudaStreamSynchronize(d.compute_stream));
-        }
-        // bisection aid: LLAMA_EC3_DEFER_IMM=1 resolves the stash immediately via
-        // the flush path — identical timing to non-defer, but through defer code
-        static const bool defer_imm = []{ const char * e = getenv("LLAMA_EC3_DEFER_IMM"); return e && atoi(e) > 0; }();
-        if (defer_imm) {
-            ec3_flush(di);
-        }
-        d.t_coll_us += ggml_time_us() - t0;
-        EC3_DBG("[ec3-dbg] defer-stash dev=%d blk=%d rows=%d\n", di, g.cur_blk, n_hits);
-        return;
-    }
-
     ggml_cuda_set_device(di);
 
     // ---- fused gate+up+GLU path (paired pools) ----
@@ -1409,8 +1252,6 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
                 }
                 const size_t bytes = (size_t)d.out_rows * n_out * sizeof(float);
                 ec3_ok(di, cudaMemcpyAsync(d.h_out, d.d_out, bytes, cudaMemcpyDeviceToHost, d.compute_stream), "fused D2H");
-                d.chain_t0 = ggml_time_us();
-                d.chain_n  = n_hits;
                 d.out_rows = 0;
                 d.q8_act_ptr = nullptr;
                 d.fused_layers++;
@@ -1434,7 +1275,7 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
     // hit rows straight into it (peer write, async) and skip the D2H + host
     // scatter + thread-0 sync entirely. CPU miss rows are uploaded later in
     // redirect_finalize (after the node barrier, when they are complete).
-    if (g.redirect_on && g.cur_n_tokens == 1 && g.cur_role == 2 && n_hits > 0 && d.pending_rows == 0 && n_hits <= 64) {
+    if (g.redirect_on && g.cur_n_tokens == 1 && g.cur_role == 2 && n_hits > 0 && n_hits <= 64) {
         ec3_global::redirect_entry * re = nullptr;
         const void * base = nullptr;
         for (auto & kv : g.redirect) {
@@ -1487,10 +1328,6 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
             re->par       = par;
             d.out_rows = 0;
             d.t_coll_us += ggml_time_us() - t0;
-            if (g.cur_role >= 0 && g.cur_role < 3) {
-                d.t_coll_role_us[g.cur_role] += ggml_time_us() - t0;
-                d.n_coll_role[g.cur_role]++;
-            }
             if (g.stats_every > 0 && ++g.collect_calls % g.stats_every == 0) ec3_stats();
             return;
         }
@@ -1502,34 +1339,13 @@ static void ec3_collect(int di, int n_hits, float * const * dst_rows, int64_t n_
         && ec3_ok(di, cudaMemcpyAsync(d.h_out, d.d_out, bytes, cudaMemcpyDeviceToHost, d.compute_stream), "collect D2H")
         && ec3_ok(di, cudaStreamSynchronize(d.compute_stream), "collect sync");
     EC3_DBG("[ec3-dbg] collect dev=%d post-sync\n", di);
-    if (g_dbg > 0 && d.pending_rows > 0) {
-        static int violations = 0, checks = 0;
-        for (int i = 0; i < d.pending_rows; i++) {
-            checks++;
-            if (d.pending_dst[i][0] != 1e30f && violations++ < 8) {
-                EC3_LOG("[ec3-dbg] DEFER VIOLATION blk=%d row=%d poison gone (%.3g) after %d ok\n",
-                        d.pending_blk, i, d.pending_dst[i][0], checks);
-            }
-        }
-    }
-    for (int i = 0; i < d.pending_rows; i++) {
-        if (cok) memcpy(d.pending_dst[i], d.h_out + (size_t)i * n_out, n_out * sizeof(float));
-        else     memset(d.pending_dst[i], 0, n_out * sizeof(float));
-    }
     for (int i = 0; i < n_hits; i++) {
-        if (cok) memcpy(dst_rows[i], d.h_out + (size_t)(d.pending_rows + i) * n_out, n_out * sizeof(float));
+        if (cok) memcpy(dst_rows[i], d.h_out + (size_t)i * n_out, n_out * sizeof(float));
         else     memset(dst_rows[i], 0, n_out * sizeof(float));
     }
-    d.out_rows       = 0;
-    d.pending_active = false;
-    d.pending_rows   = 0;
-    d.q8_act_ptr     = nullptr;
-    const int64_t dt = ggml_time_us() - t0;
-    d.t_coll_us += dt;
-    if (g.cur_role >= 0 && g.cur_role < 3) {
-        d.t_coll_role_us[g.cur_role] += dt;
-        d.n_coll_role[g.cur_role]++;
-    }
+    d.out_rows   = 0;
+    d.q8_act_ptr = nullptr;
+    d.t_coll_us += ggml_time_us() - t0;
 
     if (g.stats_every > 0 && ++g.collect_calls % g.stats_every == 0) {
         ec3_stats();
@@ -1573,15 +1389,6 @@ static int ec3_redirect_finalize(const void * host_dst_data, void * consumer_bac
     ggml_backend_t be = (ggml_backend_t)consumer_backend;
     ggml_backend_cuda_context * cc = (ggml_backend_cuda_context *)be->context;
     ggml_cuda_set_device(cc->device);
-    if (cudaEventQuery(d.redir_evt[re.par]) == cudaSuccess) {
-        d.evt_ready++;
-    } else {
-        cudaGetLastError();
-        const int64_t ew0 = ggml_time_us();
-        cudaEventSynchronize(d.redir_evt[re.par]);   // probe: residual chain latency at point-of-need
-        d.evt_wait_us += ggml_time_us() - ew0;
-        d.evt_wait_n++;
-    }
     if (!ec3_ok(re.dev, cudaStreamWaitEvent(cc->stream(), d.redir_evt[re.par], 0), "redirect wait") ||
         !ec3_ok(re.dev, cudaMemcpyAsync(re.gpu_ptr, img, (size_t)re.n_rows * re.nb1,
                                cudaMemcpyHostToDevice, cc->stream()), "redirect H2D")) {
@@ -1626,17 +1433,8 @@ static unsigned long long ec3_glu_hits(const void * src0_data, const void * src1
         if (ith == 0 && !f.scattered) {
             ec3_device & d = g.dev[di];
             ggml_cuda_set_device(di);
-            const int64_t gs0 = ggml_time_us();
             const bool gok = !d.dead &&
                 ec3_ok(di, cudaStreamSynchronize(d.compute_stream), "glu sync");   // D2H of fused rows
-            d.glusync_us += ggml_time_us() - gs0;
-            d.glusync_n++;
-            if (d.chain_t0 > 0 && d.chain_n > 0) {
-                const int b = d.chain_n <= 6 ? 0 : d.chain_n <= 12 ? 1 : d.chain_n <= 18 ? 2 : d.chain_n <= 24 ? 3 : 4;
-                d.chain_us[b]  += ggml_time_us() - d.chain_t0;
-                d.chain_cnt[b] += 1;
-                d.chain_t0 = 0;
-            }
             for (int i = 0; i < f.n; i++) {
                 char * row = (char *)dst_data + (size_t)f.rows[i] * dst_nb1;
                 if (gok) memcpy(row, d.h_out + (size_t)i * f.n_out, f.n_out * sizeof(float));
@@ -1683,10 +1481,8 @@ extern "C" size_t ggml_expert_cache_v3_trim(int device) {
     if (d.d_act_q8) { cudaFree(d.d_act_q8);       d.d_act_q8 = nullptr; d.act_q8_cap = 0; }
     if (d.d_out)    { freed += d.d_out_cap; cudaFree(d.d_out); d.d_out = nullptr; d.d_out_cap = 0; }
     cudaGetLastError();
-    d.pending_active = false;
-    d.pending_rows   = 0;
-    d.out_rows       = 0;
-    d.fused.active   = false;
+    d.out_rows     = 0;
+    d.fused.active = false;
     memset(g.resident_pair, 0, sizeof(g.resident_pair));
     memset(g.resident_down, 0, sizeof(g.resident_down));
     d.dead = true;
@@ -1731,25 +1527,6 @@ static void ec3_invalidate(const void * base, size_t size) {
     for (int b = 0; b < 1024; b++) {
         if (in_range(g.role_base[0][b])) g.role_base[0][b] = nullptr;
         if (in_range(g.role_base[1][b])) g.role_base[1][b] = nullptr;
-    }
-}
-
-// ---- API: cache-aware routing bias ------------------------------------------------------
-
-static int ec3_router_bias_active(void) {
-    return g.enabled && g.rbias_strength > 0.0f;
-}
-
-static void ec3_router_bias(int il, int n_expert, float * dst) {
-    const float s = (g.enabled && !g.bail.tripped) ? g.rbias_strength : 0.0f;
-    if (il < 0 || il >= 1024 || n_expert > 256 || s <= 0.0f) {
-        for (int e = 0; e < n_expert; e++) dst[e] = 0.0f;
-        return;
-    }
-    for (int e = 0; e < n_expert; e++) {
-        const bool res = ((g.resident_pair[il][e >> 6] >> (e & 63)) & 1) &&
-                         ((g.resident_down[il][e >> 6] >> (e & 63)) & 1);
-        dst[e] = res ? s : 0.0f;
     }
 }
 
@@ -1819,39 +1596,6 @@ static void ec3_stats(void) {
                 EC3_LOG("[ec3] bail-ewma: base=%.1fus(n=%lld) on=%.1fus(n=%lld)\n",
                         g.bail.base_ewma, g.bail.base_n, g.bail.on_ewma, g.bail.on_n);
             }
-            {
-                std::vector<uint32_t> hv;
-                for (int pi2 = 0; pi2 < d.n_pools; pi2++) {
-                    ec3_pool & pp = d.pools[pi2];
-                    for (int s2 = 0; s2 < pp.n_used; s2++) if (pp.slots[s2].valid) hv.push_back(pp.slots[s2].nhits);
-                }
-                if (hv.size() > 16) {
-                    std::sort(hv.begin(), hv.end(), std::greater<uint32_t>());
-                    long long tot = 0; for (auto v : hv) tot += v;
-                    auto cum = [&](double frac) {
-                        long long s3 = 0; size_t n3 = (size_t)(hv.size() * frac);
-                        for (size_t j = 0; j < n3; j++) s3 += hv[j];
-                        return tot > 0 ? 100.0 * s3 / tot : 0.0;
-                    };
-                    EC3_LOG("[ec3] dev=%d popularity: top10%%=%.0f%% top30%%=%.0f%% top50%%=%.0f%% of hits (slots=%zu)\n",
-                            i, cum(0.10), cum(0.30), cum(0.50), hv.size());
-                }
-            }
-            EC3_LOG("[ec3] dev=%d chain-buckets(us): 1-6=%.0f(n=%lld) 7-12=%.0f(n=%lld) 13-18=%.0f(n=%lld) 19-24=%.0f(n=%lld) 25+=%.0f(n=%lld)\n",
-                    i,
-                    d.chain_cnt[0] ? (double)d.chain_us[0]/d.chain_cnt[0] : 0.0, d.chain_cnt[0],
-                    d.chain_cnt[1] ? (double)d.chain_us[1]/d.chain_cnt[1] : 0.0, d.chain_cnt[1],
-                    d.chain_cnt[2] ? (double)d.chain_us[2]/d.chain_cnt[2] : 0.0, d.chain_cnt[2],
-                    d.chain_cnt[3] ? (double)d.chain_us[3]/d.chain_cnt[3] : 0.0, d.chain_cnt[3],
-                    d.chain_cnt[4] ? (double)d.chain_us[4]/d.chain_cnt[4] : 0.0, d.chain_cnt[4]);
-            EC3_LOG("[ec3] dev=%d stickout: glu=%.1fus(n=%lld) down-ready=%lld down-wait=%.1fus(n=%lld)\n",
-                    i, d.glusync_n ? (double)d.glusync_us/d.glusync_n : 0.0, d.glusync_n,
-                    d.evt_ready,
-                    d.evt_wait_n ? (double)d.evt_wait_us/d.evt_wait_n : 0.0, d.evt_wait_n);
-            EC3_LOG("[ec3] dev=%d coll-by-role: gate=%.1fus(n=%lld) up=%.1fus(n=%lld) down=%.1fus(n=%lld)\n", i,
-                    d.n_coll_role[0] ? (double)d.t_coll_role_us[0]/d.n_coll_role[0] : 0.0, d.n_coll_role[0],
-                    d.n_coll_role[1] ? (double)d.t_coll_role_us[1]/d.n_coll_role[1] : 0.0, d.n_coll_role[1],
-                    d.n_coll_role[2] ? (double)d.t_coll_role_us[2]/d.n_coll_role[2] : 0.0, d.n_coll_role[2]);
         }
     }
 }
@@ -1961,12 +1705,6 @@ static void ec3_selftest(void) {
     all &= ec3_selftest_one(0, GGML_TYPE_Q4_K, 2048, 768,  1, true);
     all &= ec3_selftest_one(0, GGML_TYPE_Q6_K, 2048, 768,  5, true);
     all &= ec3_selftest_one(0, GGML_TYPE_Q6_K, 512,  2048, 8, false);
-    if (getenv("LLAMA_EC3_NSWEEP")) {
-        EC3_LOG("[ec3-selftest] === n-sweep (striping economics: fixed vs per-row cost) ===\n");
-        for (int n : {1, 2, 4, 8, 16, 32}) {
-            ec3_selftest_one(0, GGML_TYPE_Q4_K, 5120, 3072, n, true);
-        }
-    }
     EC3_LOG("[ec3-selftest] %s\n", all ? "ALL PASS" : "FAILURES PRESENT");
 }
 
@@ -1990,36 +1728,18 @@ void ggml_expert_cache_v3_register(void) {
     if (const char * e = getenv("LLAMA_EC3_BUDGET_MB")) g.budget_mb = (size_t)atoll(e);
     if (const char * e = getenv("LLAMA_EC3_INSERTS"))   g.inserts_per_plan = atoi(e);
     if (const char * e = getenv("LLAMA_EC3_THROTTLE"))  { g.throttle_mod = atoi(e); if (g.throttle_mod < 1) g.throttle_mod = 1; }
-    if (const char * e = getenv("LLAMA_EC3_GREEDY_LAST")) g.greedy_last = atoi(e) != 0;
     if (const char * e = getenv("LLAMA_EC3_WORKERS"))   { int n = atoi(e); if (n > 0 && n <= 16) g.n_workers = n; }
     if (const char * e = getenv("LLAMA_EC3_STATS"))     g.stats_every = atoi(e);
     if (const char * e = getenv("LLAMA_EC3_MIN_EXPERT_KB")) g.min_expert_bytes = (size_t)atoll(e) << 10;
     if (const char * e = getenv("LLAMA_EC3_RESERVE_MB"))    g.reserve_mb = (size_t)atoll(e);
-    if (const char * e = getenv("LLAMA_EC3_DEFER"))         g.defer = atoi(e) > 0;
     if (const char * e = getenv("LLAMA_EC3_REUSE"))         g.reuse = atoi(e) > 0;
-    if (const char * e = getenv("LLAMA_EC3_STRIPE"))        g.stripe = atoi(e) > 0;
     if (const char * e = getenv("LLAMA_EC3_FUSE"))          g.fuse = atoi(e) > 0;
     if (const char * e = getenv("LLAMA_EC3_MAX_BATCH"))     { int n = atoi(e); if (n >= 1 && n <= 8) g.max_batch = n; }
     if (const char * e = getenv("LLAMA_EC3_PREFETCH"))      g.backfill.enabled = atoi(e) > 0;
     if (const char * e = getenv("LLAMA_EC3_HOTSET"))        g.hotset_enabled = atoi(e) > 0;
     g.hotset_last_save = ggml_time_us();   // first save no sooner than one period in
-    if (const char * e = getenv("LLAMA_EC3_RBIAS"))         g.rbias_strength = (float)atof(e);
-    if (const char * e = getenv("LLAMA_EC3_ORACLE"))        { g.oracle_bias = atoi(e) > 0;
-        if (g.oracle_bias) EC3_LOG("[ec3] ORACLE BIAS ON: outputs are intentionally wrong (speed-ceiling research)\n"); }
     memset(g.blk_pair_pool, -1, sizeof(g.blk_pair_pool));
     memset(g.blk_down_pool, -1, sizeof(g.blk_down_pool));
-    if (g.stripe && g.fuse) {
-        g.fuse = false;  // pair state is per-device; striping splits roles across devices
-        EC3_LOG("[ec3] stripe mode: fuse disabled\n");
-    }
-    if (g.stripe) {
-        // gate and up land on different devices: the defer absorb would dangle
-        // past the swiglu read (corruption), and the act-quant reuse state is
-        // per-device — both must be off in striped mode
-        g.defer = false;
-        g.reuse = false;
-        EC3_LOG("[ec3] stripe mode: defer/reuse disabled\n");
-    }
 
     ggml_expert_cache_v3.begin    = ec3_begin;
     ggml_expert_cache_v3.plan     = ec3_plan;
@@ -2031,8 +1751,6 @@ void ggml_expert_cache_v3_register(void) {
     ggml_expert_cache_v3.glu_hits          = ec3_glu_hits;
     ggml_expert_cache_v3.invalidate        = ec3_invalidate;
     ggml_expert_cache_v3.node_time         = ec3_node_time;
-    ggml_expert_cache_v3.router_bias        = ec3_router_bias;
-    ggml_expert_cache_v3.router_bias_active = ec3_router_bias_active;
     if (const char * e = getenv("LLAMA_EC3_REDIRECT")) g.redirect_on = atoi(e) > 0;
 
     EC3_LOG("[ec3] enabled: n_dev=%d budget=%s inserts/plan=%d workers=%d stats_every=%d\n",

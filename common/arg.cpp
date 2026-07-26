@@ -23,6 +23,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cerrno>
 #include <cinttypes>
 #include <climits>
 #include <cstdarg>
@@ -624,6 +625,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         if (preset_has_hf_repo) {
             params.model.hf_repo = preset_hf_repo;
         }
+    }
+
+    if (params.moe_cache_force && !params.no_extra_bufts) {
+        LOG_INF("explicit MoE cache mode disables weight repacking\n");
+        params.no_extra_bufts = true;
     }
 
     postprocess_cpu_params(params.cpuparams,       nullptr);
@@ -2350,15 +2356,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
-        {"--moe-cache"}, "N",
+        {"--moe-cache"}, "MODE",
         "adaptively cache the hottest CPU-resident MoE experts in spare VRAM "
-        "(default: auto; 0 = off; N = VRAM budget in MiB per device)",
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value");
-            }
-            // the cache lives in the CUDA backend and configures itself from the
-            // environment at backend-registration time
+        "(default: auto; auto = preserve weight repacking; on = automatic budget without weight repacking; "
+        "off/0 = disabled; N = VRAM budget in MiB per device without weight repacking)",
+        [](common_params & params, const std::string & value) {
             auto set_env_var = [](const char * name, const char * val) {
 #if defined(_WIN32)
                 _putenv_s(name, val);
@@ -2366,12 +2368,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 setenv(name, val, 1);
 #endif
             };
-            if (value == 0) {
+            auto unset_env_var = [](const char * name) {
+#if defined(_WIN32)
+                _putenv_s(name, "");
+#else
+                unsetenv(name);
+#endif
+            };
+
+            if (value == "off" || value == "0") {
                 set_env_var("GGML_CUDA_MOE_CACHE", "0");
+                set_env_var("GGML_CUDA_MOE_CACHE_MODE", "off");
+                unset_env_var("GGML_CUDA_MOE_CACHE_BUDGET_MB");
+                params.moe_cache_force = false;
+            } else if (value == "auto") {
+                set_env_var("GGML_CUDA_MOE_CACHE", "1");
+                set_env_var("GGML_CUDA_MOE_CACHE_MODE", "auto");
+                unset_env_var("GGML_CUDA_MOE_CACHE_BUDGET_MB");
+                params.moe_cache_force = false;
+            } else if (value == "on") {
+                set_env_var("GGML_CUDA_MOE_CACHE", "1");
+                set_env_var("GGML_CUDA_MOE_CACHE_MODE", "on");
+                unset_env_var("GGML_CUDA_MOE_CACHE_BUDGET_MB");
+                params.moe_cache_force = true;
             } else {
-                set_env_var("GGML_CUDA_MOE_CACHE_BUDGET_MB", std::to_string(value).c_str());
+                char * end = nullptr;
+                errno = 0;
+                const long long budget_mb = strtoll(value.c_str(), &end, 10);
+                if (errno != 0 || end == value.c_str() || *end != '\0' ||
+                    budget_mb <= 0 || budget_mb > 1024 * 1024) {
+                    throw std::invalid_argument("expected auto, on, off, 0, or a positive MiB budget");
+                }
+                set_env_var("GGML_CUDA_MOE_CACHE", "1");
+                set_env_var("GGML_CUDA_MOE_CACHE_MODE", "on");
+                set_env_var("GGML_CUDA_MOE_CACHE_BUDGET_MB", std::to_string(budget_mb).c_str());
+                params.moe_cache_force = true;
             }
-            (void) params;
         }
     ).set_env("LLAMA_ARG_MOE_CACHE"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0

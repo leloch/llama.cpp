@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <cinttypes>
 #include <clocale>
@@ -276,6 +277,107 @@ static std::string pair_str(const std::pair<int, int> & p) {
     return buf;
 }
 
+static std::string parse_moe_cache_mode(const std::string & value) {
+    if (value == "off" || value == "0") {
+        return "off";
+    }
+    if (value == "auto" || value == "on") {
+        return value;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const long long budget_mb = strtoll(value.c_str(), &end, 10);
+    if (errno != 0 || end == value.c_str() || *end != '\0' ||
+        budget_mb <= 0 || budget_mb > 1024 * 1024) {
+        throw std::invalid_argument("expected auto, on, off, 0, or a positive MiB budget");
+    }
+    return std::to_string(budget_mb);
+}
+
+static bool moe_cache_mode_forces_canonical_weights(const std::string & mode) {
+    return mode == "on" || (mode != "auto" && mode != "off");
+}
+
+static std::string parse_repack_mode(const std::string & value) {
+    if (value == "auto" || value == "on" || value == "off") {
+        return value;
+    }
+    throw std::invalid_argument("expected auto, on, or off");
+}
+
+static bool get_effective_repack(const std::string & cache_mode, const std::string & repack_mode) {
+    if (moe_cache_mode_forces_canonical_weights(cache_mode)) {
+        if (repack_mode == "on") {
+            throw std::invalid_argument("repack=on is incompatible with MoE cache on or a fixed cache budget");
+        }
+        return false;
+    }
+    return repack_mode != "off";
+}
+
+static void set_env_var(const char * name, const char * value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
+static void unset_env_var(const char * name) {
+#if defined(_WIN32)
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
+
+static void apply_moe_cache_mode(const std::string & mode) {
+    if (mode == "off") {
+        set_env_var("GGML_CUDA_MOE_CACHE", "0");
+        set_env_var("GGML_CUDA_MOE_CACHE_MODE", "off");
+        unset_env_var("GGML_CUDA_MOE_CACHE_BUDGET_MB");
+    } else if (mode == "auto") {
+        set_env_var("GGML_CUDA_MOE_CACHE", "1");
+        set_env_var("GGML_CUDA_MOE_CACHE_MODE", "auto");
+        unset_env_var("GGML_CUDA_MOE_CACHE_BUDGET_MB");
+    } else if (mode == "on") {
+        set_env_var("GGML_CUDA_MOE_CACHE", "1");
+        set_env_var("GGML_CUDA_MOE_CACHE_MODE", "on");
+        unset_env_var("GGML_CUDA_MOE_CACHE_BUDGET_MB");
+    } else {
+        set_env_var("GGML_CUDA_MOE_CACHE", "1");
+        set_env_var("GGML_CUDA_MOE_CACHE_MODE", "on");
+        set_env_var("GGML_CUDA_MOE_CACHE_BUDGET_MB", mode.c_str());
+    }
+}
+
+static std::string get_moe_cache_mode_from_env() {
+    if (const char * mode = getenv("LLAMA_ARG_MOE_CACHE")) {
+        return parse_moe_cache_mode(mode);
+    }
+    if (const char * enabled = getenv("GGML_CUDA_MOE_CACHE")) {
+        if (strcmp(enabled, "0") == 0) {
+            return "off";
+        }
+    }
+    if (const char * budget = getenv("GGML_CUDA_MOE_CACHE_BUDGET_MB")) {
+        try {
+            return parse_moe_cache_mode(budget);
+        } catch (const std::invalid_argument &) {
+        }
+    }
+    if (const char * mode = getenv("GGML_CUDA_MOE_CACHE_MODE")) {
+        if (strcmp(mode, "on") == 0) {
+            return "on";
+        }
+        if (strcmp(mode, "off") == 0) {
+            return "off";
+        }
+    }
+    return "auto";
+}
+
 static std::vector<int> parse_int_range(const std::string & s, bool allow_negative = false) {
     // first[-last[(+|*)step]]
     std::regex range_regex(allow_negative
@@ -325,6 +427,7 @@ struct cmd_params {
     std::string                      hf_token;
     std::vector<int>                 n_prompt;
     std::vector<int>                 n_gen;
+    int                              n_gen_warmup;
     std::vector<std::pair<int, int>> n_pg;
     std::vector<int>                 n_depth;
     std::vector<int>                 n_batch;
@@ -337,6 +440,8 @@ struct cmd_params {
     std::vector<int>                 poll;
     std::vector<int>                 n_gpu_layers;
     std::vector<int>                 n_cpu_moe;
+    std::vector<std::string>         moe_cache;
+    std::string                      repack;
     std::vector<llama_split_mode>    split_mode;
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
@@ -358,6 +463,9 @@ struct cmd_params {
     bool                             verbose;
     bool                             progress;
     bool                             no_warmup;
+    bool                             moe_cache_explicit;
+    bool                             n_gen_warmup_explicit;
+    bool                             repack_explicit;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -369,6 +477,7 @@ static const cmd_params cmd_params_defaults = {
     /* hf_token             */ "",
     /* n_prompt             */ { 512 },
     /* n_gen                */ { 128 },
+    /* n_gen_warmup         */ 1,
     /* n_pg                 */ {},
     /* n_depth              */ { 0 },
     /* n_batch              */ { 2048 },
@@ -381,6 +490,8 @@ static const cmd_params cmd_params_defaults = {
     /* poll                 */ { 50 },
     /* n_gpu_layers         */ { -1 },
     /* n_cpu_moe            */ { 0 },
+    /* moe_cache            */ { "auto" },
+    /* repack               */ "auto",
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
@@ -402,6 +513,9 @@ static const cmd_params cmd_params_defaults = {
     /* verbose              */ false,
     /* progress             */ false,
     /* no_warmup            */ false,
+    /* moe_cache_explicit   */ false,
+    /* n_gen_warmup_explicit*/ false,
+    /* repack_explicit      */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -421,6 +535,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
+    printf("  --n-gen-warmup <n>                         generation tokens to run before timing (default: %d)\n", cmd_params_defaults.n_gen_warmup);
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
     if (llama_supports_rpc()) {
@@ -451,6 +566,10 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --poll <0...100>                            (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
     printf("  -ngl, --n-gpu-layers <n>                    (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                     (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
+    printf("  --moe-cache <auto|on|off|0|MiB>             (default: %s)\n", join(cmd_params_defaults.moe_cache, ",").c_str());
+    printf("                                              on and fixed budgets disable weight repacking\n");
+    printf("  --repack <auto|on|off>                      weight repacking policy (default: %s)\n", cmd_params_defaults.repack.c_str());
+    printf("  -nr, --no-repack                            equivalent to --repack off\n");
     printf("  -sm, --split-mode <none|layer|row|tensor>   (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                         (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
@@ -516,6 +635,11 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
+    params.n_gen_warmup         = cmd_params_defaults.n_gen_warmup;
+    params.repack               = cmd_params_defaults.repack;
+    params.moe_cache_explicit    = cmd_params_defaults.moe_cache_explicit;
+    params.n_gen_warmup_explicit = cmd_params_defaults.n_gen_warmup_explicit;
+    params.repack_explicit       = cmd_params_defaults.repack_explicit;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -572,6 +696,18 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_gen.insert(params.n_gen.end(), p.begin(), p.end());
+            } else if (arg == "--n-gen-warmup") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                if (p.size() != 1) {
+                    invalid_param = true;
+                    break;
+                }
+                params.n_gen_warmup = p[0];
+                params.n_gen_warmup_explicit = true;
             } else if (arg == "-pg") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -722,6 +858,26 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_cpu_moe.insert(params.n_cpu_moe.end(), p.begin(), p.end());
+            } else if (arg == "--moe-cache") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                for (const auto & value : p) {
+                    params.moe_cache.push_back(parse_moe_cache_mode(value));
+                }
+                params.moe_cache_explicit = true;
+            } else if (arg == "--repack") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.repack = parse_repack_mode(argv[i]);
+                params.repack_explicit = true;
+            } else if (arg == "-nr" || arg == "--no-repack") {
+                params.repack = "off";
+                params.repack_explicit = true;
             } else if (llama_supports_rpc() && (arg == "-rpc" || arg == "--rpc")) {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1084,6 +1240,14 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.n_cpu_moe.empty()) {
         params.n_cpu_moe = cmd_params_defaults.n_cpu_moe;
     }
+    if (params.moe_cache.empty()) {
+        try {
+            params.moe_cache = { get_moe_cache_mode_from_env() };
+        } catch (const std::invalid_argument & e) {
+            fprintf(stderr, "error: invalid LLAMA_ARG_MOE_CACHE: %s\n", e.what());
+            exit(1);
+        }
+    }
     if (params.split_mode.empty()) {
         params.split_mode = cmd_params_defaults.split_mode;
     }
@@ -1138,6 +1302,17 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.fit_params_min_ctx.empty()) {
         params.fit_params_min_ctx = cmd_params_defaults.fit_params_min_ctx;
     }
+    if (params.no_warmup) {
+        params.n_gen_warmup = 0;
+    }
+    for (const auto & cache_mode : params.moe_cache) {
+        try {
+            (void) get_effective_repack(cache_mode, params.repack);
+        } catch (const std::invalid_argument & e) {
+            fprintf(stderr, "error: %s\n", e.what());
+            exit(1);
+        }
+    }
 
     return params;
 }
@@ -1146,6 +1321,7 @@ struct cmd_params_instance {
     std::string        model;
     int                n_prompt;
     int                n_gen;
+    int                n_gen_warmup;
     int                n_depth;
     int                n_batch;
     int                n_ubatch;
@@ -1157,6 +1333,8 @@ struct cmd_params_instance {
     int                poll;
     int                n_gpu_layers;
     int                n_cpu_moe;
+    std::string        moe_cache;
+    bool               repack;
     llama_split_mode   split_mode;
     int                main_gpu;
     bool               no_kv_offload;
@@ -1184,6 +1362,7 @@ struct cmd_params_instance {
         mparams.tensor_split  = tensor_split.data();
         mparams.use_mmap      = use_mmap;
         mparams.use_direct_io = use_direct_io;
+        mparams.use_extra_bufts = repack;
         mparams.no_host       = no_host;
 
         if (n_cpu_moe <= 0) {
@@ -1227,6 +1406,7 @@ struct cmd_params_instance {
 
     bool equal_mparams(const cmd_params_instance & other) const {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
+               repack == other.repack &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                use_mmap == other.use_mmap && use_direct_io == other.use_direct_io &&
@@ -1238,7 +1418,7 @@ struct cmd_params_instance {
     llama_context_params to_llama_cparams() const {
         llama_context_params cparams = llama_context_default_params();
 
-        cparams.n_ctx           = n_prompt + n_gen + n_depth;
+        cparams.n_ctx           = n_prompt + std::max(n_gen + n_depth, n_gen_warmup);
         cparams.n_batch         = n_batch;
         cparams.n_ubatch        = n_ubatch;
         cparams.type_k          = type_k;
@@ -1263,6 +1443,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & fpc : params.fit_params_min_ctx)
     for (const auto & nl : params.n_gpu_layers)
     for (const auto & ncmoe : params.n_cpu_moe)
+    for (const auto & mc : params.moe_cache)
     for (const auto & sm : params.split_mode)
     for (const auto & mg : params.main_gpu)
     for (const auto & devs : params.devices)
@@ -1292,6 +1473,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .model        = */ m,
                 /* .n_prompt     = */ n_prompt,
                 /* .n_gen        = */ 0,
+                /* .n_gen_warmup = */ 0,
                 /* .n_depth      = */ nd,
                 /* .n_batch      = */ nb,
                 /* .n_ubatch     = */ nub,
@@ -1303,6 +1485,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .poll         = */ pl,
                 /* .n_gpu_layers = */ nl,
                 /* .n_cpu_moe    = */ ncmoe,
+                /* .moe_cache    = */ mc,
+                /* .repack       = */ get_effective_repack(mc, params.repack),
                 /* .split_mode   = */ sm,
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
@@ -1329,6 +1513,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .model        = */ m,
                 /* .n_prompt     = */ 0,
                 /* .n_gen        = */ n_gen,
+                /* .n_gen_warmup = */ params.n_gen_warmup,
                 /* .n_depth      = */ nd,
                 /* .n_batch      = */ nb,
                 /* .n_ubatch     = */ nub,
@@ -1340,6 +1525,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .poll         = */ pl,
                 /* .n_gpu_layers = */ nl,
                 /* .n_cpu_moe    = */ ncmoe,
+                /* .moe_cache    = */ mc,
+                /* .repack       = */ get_effective_repack(mc, params.repack),
                 /* .split_mode   = */ sm,
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
@@ -1366,6 +1553,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .model        = */ m,
                 /* .n_prompt     = */ n_pg.first,
                 /* .n_gen        = */ n_pg.second,
+                /* .n_gen_warmup = */ n_pg.second > 0 ? params.n_gen_warmup : 0,
                 /* .n_depth      = */ nd,
                 /* .n_batch      = */ nb,
                 /* .n_ubatch     = */ nub,
@@ -1377,6 +1565,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .poll         = */ pl,
                 /* .n_gpu_layers = */ nl,
                 /* .n_cpu_moe    = */ ncmoe,
+                /* .moe_cache    = */ mc,
+                /* .repack       = */ get_effective_repack(mc, params.repack),
                 /* .split_mode   = */ sm,
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
@@ -1419,6 +1609,8 @@ struct test {
     ggml_type                type_v;
     int                      n_gpu_layers;
     int                      n_cpu_moe;
+    std::string              moe_cache;
+    bool                     repack;
     llama_split_mode         split_mode;
     int                      main_gpu;
     bool                     no_kv_offload;
@@ -1435,6 +1627,7 @@ struct test {
     uint32_t                 fit_min_ctx;
     int                      n_prompt;
     int                      n_gen;
+    int                      n_gen_warmup;
     int                      n_depth;
     std::string              test_time;
     std::vector<uint64_t>    samples_ns;
@@ -1459,6 +1652,8 @@ struct test {
         type_v         = inst.type_v;
         n_gpu_layers   = inst.n_gpu_layers;
         n_cpu_moe      = inst.n_cpu_moe;
+        moe_cache      = inst.moe_cache;
+        repack         = inst.repack;
         split_mode     = inst.split_mode;
         main_gpu       = inst.main_gpu;
         no_kv_offload  = inst.no_kv_offload;
@@ -1475,6 +1670,7 @@ struct test {
         fit_min_ctx    = inst.fit_min_ctx;
         n_prompt       = inst.n_prompt;
         n_gen          = inst.n_gen;
+        n_gen_warmup   = inst.n_gen_warmup;
         n_depth        = inst.n_depth;
         // RFC 3339 date-time format
         time_t t       = time(NULL);
@@ -1527,11 +1723,12 @@ struct test {
             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
-            "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
+            "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "moe_cache",
+            "repack",         "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
             "no_op_offload",  "no_host",        "fit_target",     "fit_min_ctx",
-            "n_prompt",       "n_gen",          "n_depth",
+            "n_prompt",       "n_gen",          "n_gen_warmup",  "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
         return fields;
@@ -1542,13 +1739,15 @@ struct test {
     static field_type get_field_type(const std::string & field) {
         if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "n_threads" ||
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
-            field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
+            field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_gen_warmup" ||
+            field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
             field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
-            field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host") {
+            field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host" ||
+            field == "repack") {
             return BOOL;
         }
         if (field == "avg_ts" || field == "stddev_ts") {
@@ -1613,6 +1812,8 @@ struct test {
                                             ggml_type_name(type_v),
                                             std::to_string(n_gpu_layers),
                                             std::to_string(n_cpu_moe),
+                                            moe_cache,
+                                            std::to_string(repack),
                                             split_mode_str(split_mode),
                                             std::to_string(main_gpu),
                                             std::to_string(no_kv_offload),
@@ -1629,6 +1830,7 @@ struct test {
                                             std::to_string(fit_min_ctx),
                                             std::to_string(n_prompt),
                                             std::to_string(n_gen),
+                                            std::to_string(n_gen_warmup),
                                             std::to_string(n_depth),
                                             test_time,
                                             std::to_string(avg_ns()),
@@ -1642,6 +1844,7 @@ struct test {
         std::map<std::string, std::string> map;
         auto                               fields = get_fields();
         auto                               values = get_values();
+        GGML_ASSERT(fields.size() == values.size());
         std::transform(fields.begin(), fields.end(), values.begin(), std::inserter(map, map.end()),
                        std::make_pair<const std::string &, const std::string &>);
         return map;
@@ -1785,6 +1988,15 @@ struct markdown_printer : public printer {
         if (field == "n_gpu_layers") {
             return 3;
         }
+        if (field == "moe_cache") {
+            return -9;
+        }
+        if (field == "repack") {
+            return -6;
+        }
+        if (field == "n_gen_warmup") {
+            return 9;
+        }
         if (field == "n_threads") {
             return 7;
         }
@@ -1836,6 +2048,12 @@ struct markdown_printer : public printer {
         }
         if (field == "split_mode") {
             return "sm";
+        }
+        if (field == "moe_cache") {
+            return "moe-cache";
+        }
+        if (field == "n_gen_warmup") {
+            return "warmup";
         }
         if (field == "n_threads") {
             return "threads";
@@ -1893,6 +2111,17 @@ struct markdown_printer : public printer {
         }
         if (params.n_cpu_moe.size() > 1 || params.n_cpu_moe != cmd_params_defaults.n_cpu_moe) {
             fields.emplace_back("n_cpu_moe");
+        }
+        if (params.moe_cache_explicit || params.moe_cache.size() > 1 ||
+            params.moe_cache != cmd_params_defaults.moe_cache) {
+            fields.emplace_back("moe_cache");
+        }
+        const bool cache_forces_canonical_weights =
+            std::any_of(params.moe_cache.begin(), params.moe_cache.end(),
+                moe_cache_mode_forces_canonical_weights);
+        if (params.repack_explicit || params.repack != cmd_params_defaults.repack ||
+            cache_forces_canonical_weights) {
+            fields.emplace_back("repack");
         }
         if (params.n_threads.size() > 1 || params.n_threads != cmd_params_defaults.n_threads || is_cpu_backend) {
             fields.emplace_back("n_threads");
@@ -1960,6 +2189,10 @@ struct markdown_printer : public printer {
         if (params.fit_params_min_ctx.size() > 1 || params.fit_params_min_ctx != cmd_params_defaults.fit_params_min_ctx) {
             fields.emplace_back("fit_min_ctx");
         }
+        if (params.n_gen_warmup_explicit ||
+            params.n_gen_warmup != cmd_params_defaults.n_gen_warmup) {
+            fields.emplace_back("n_gen_warmup");
+        }
         fields.emplace_back("test");
         fields.emplace_back("t/s");
 
@@ -1985,6 +2218,8 @@ struct markdown_printer : public printer {
             char        buf[128];
             if (field == "model") {
                 value = t.model_type;
+            } else if (field == "repack") {
+                value = t.repack ? "on" : "off";
             } else if (field == "size") {
                 if (t.model_size < 1024 * 1024 * 1024) {
                     snprintf(buf, sizeof(buf), "%.2f MiB", t.model_size / 1024.0 / 1024.0);
@@ -2234,6 +2469,7 @@ int llama_bench(int argc, char ** argv) {
         if (params.progress) {
             fprintf(stderr, "llama-bench: benchmark %d/%zu: starting\n", params_idx, params_count);
         }
+        apply_moe_cache_mode(inst.moe_cache);
         auto mparams = inst.to_llama_mparams();
         auto cparams = inst.to_llama_cparams();
 
@@ -2259,7 +2495,7 @@ int llama_bench(int argc, char ** argv) {
 
             std::vector<size_t> margins(llama_max_devices(), inst.fit_target * 1024 * 1024);
 
-            uint32_t n_ctx_needed = inst.n_prompt + inst.n_gen + inst.n_depth;
+            uint32_t n_ctx_needed = inst.n_prompt + std::max(inst.n_gen + inst.n_depth, inst.n_gen_warmup);
             cparams.n_ctx = std::max(cparams.n_ctx, n_ctx_needed);
 
             common_fit_params(inst.model.c_str(), &mparams, &cparams,
@@ -2336,11 +2572,12 @@ int llama_bench(int argc, char ** argv) {
                     exit(1);
                 }
             }
-            if (t.n_gen > 0) {
+            if (t.n_gen_warmup > 0) {
                 if (params.progress) {
-                    fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup generation run\n", params_idx, params_count);
+                    fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup generation run (%d tokens)\n",
+                            params_idx, params_count, t.n_gen_warmup);
                 }
-                bool res = test_gen(ctx, 1, t.n_threads);
+                bool res = test_gen(ctx, t.n_gen_warmup, t.n_threads);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run gen warmup\n", __func__);
                     llama_free(ctx);

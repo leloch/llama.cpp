@@ -34,6 +34,7 @@ options:
   -v, --verbose                             verbose output
   --progress                                print test progress indicators
   --no-warmup                               skip warmup runs before benchmarking
+  --n-gen-warmup <n>                       generation tokens to run before timing (default: 1)
   -fitt, --fit-target <MiB>                 fit model to device memory with this margin per device in MiB (default: off)
   -fitc, --fit-ctx <n>                      minimum ctx size for --fit-target (default: 4096)
   -rpc, --rpc <rpc_servers>                 register RPC devices (comma separated)
@@ -62,6 +63,9 @@ test parameters:
   --poll <0...100>                          (default: 50)
   -ngl, --n-gpu-layers <n>                  (default: -1)
   -ncmoe, --n-cpu-moe <n>                   (default: 0)
+  --moe-cache <auto|on|off|0|MiB>           (default: auto)
+  --repack <auto|on|off>                    weight repacking policy (default: auto)
+  -nr, --no-repack                          equivalent to --repack off
   -sm, --split-mode <none|layer|row|tensor> (default: layer)
   -mg, --main-gpu <i>                       (default: 0)
   -nkvo, --no-kv-offload <0|1>              (default: 0)
@@ -92,6 +96,8 @@ With the exception of `-r`, `-o` and `-v`, all options can be specified multiple
 Each test is repeated the number of times given by `-r`, and the results are averaged. The results are given in average tokens per second (t/s) and standard deviation. Some output formats (e.g. json) also include the individual results of each repetition.
 
 Using the `-d <n>` option, each test can be run at a specified context depth, prefilling the KV cache with `<n>` tokens.
+
+`--n-gen-warmup <n>` controls how many generation tokens run before timing. This is useful when a benchmark needs to populate persistent runtime state such as the MoE expert cache. `--moe-cache off` provides a hard-disabled baseline, while `auto`, `on`, and a positive per-device MiB budget enable the cache. Cache `on` and fixed-budget modes require canonical CPU weights and therefore disable repacking. Use `--repack off` for an equivalent hard-disabled baseline, for example `--moe-cache off,4096 --repack off`. The selected cache mode, effective repack setting, and effective generation warmup are included in benchmark output.
 
 For a description of the other options, see the [completion example](../completion/README.md).
 

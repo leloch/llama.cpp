@@ -1558,15 +1558,17 @@ static void ggml_compute_forward_mul_mat_id(
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
 
-    // MoE expert cache state (set on thread 0 only; other threads keep dev = -1)
+    // MoE expert cache state is used by thread 0 only.
     enum { MOE_CACHE_MAX_TOPK = 64 };
-    int           moe_cache_dev = -1;
-    int64_t       moe_cache_t0 = 0;
+    void *        moe_cache_node = NULL;
     int           moe_cache_n_hits = 0;
-    int32_t       moe_cache_slot_idx[MOE_CACHE_MAX_TOPK];   // per-k slot index, -1 = miss
-    int32_t       moe_cache_compact[MOE_CACHE_MAX_TOPK];    // slot indices of hits, in order
-    const float * moe_cache_acts[MOE_CACHE_MAX_TOPK];       // activation row per hit
-    float *       moe_cache_rows[MOE_CACHE_MAX_TOPK];       // dst row per hit
+    int32_t       moe_cache_slot_idx[MOE_CACHE_MAX_TOPK];
+    int32_t       moe_cache_compact[MOE_CACHE_MAX_TOPK];
+    int32_t       moe_cache_experts[MOE_CACHE_MAX_TOPK];
+    int32_t       moe_cache_ids[MOE_CACHE_MAX_TOPK];
+    int32_t       moe_cache_tokens[MOE_CACHE_MAX_TOPK];
+    const float * moe_cache_acts[MOE_CACHE_MAX_TOPK];
+    float *       moe_cache_rows[MOE_CACHE_MAX_TOPK];
 
     void * wdata_cur = params->wdata;
 
@@ -1623,24 +1625,24 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0) {
-        // MoE expert cache: for single-token decode, rows whose expert weights are
-        // resident in the VRAM cache are dispatched to the GPU here and excluded
-        // from the CPU row mapping. The GPU computes them while the threadpool
-        // computes the remaining rows; results land in dst in the collect step
-        // at the end of this function, before the node completes.
-        if (ggml_moe_cache.begin && src1->type == GGML_TYPE_F32 &&
+        ggml_backend_buffer_t src0_buffer =
+            src0->view_src ? src0->view_src->buffer : src0->buffer;
+        if (ggml_moe_cache.begin && ggml_moe_cache.plan &&
+            ggml_moe_cache.dispatch && ggml_moe_cache.collect && ggml_moe_cache.end &&
+            src0->op == GGML_OP_NONE && src0_buffer &&
+            ggml_backend_buffer_get_usage(src0_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+            src1->type == GGML_TYPE_F32 &&
             n_ids * ids->ne[1] <= MOE_CACHE_MAX_TOPK) {
-            moe_cache_t0 = ggml_time_us();
-            moe_cache_dev = ggml_moe_cache.begin(src0->name, src0->data, nb02,
-                                                 ne00, ne01, (int) type, ne02, ids->ne[1]);
-            if (moe_cache_dev >= 0) {
-                int32_t moe_cache_ids[MOE_CACHE_MAX_TOPK];
+            moe_cache_node = ggml_moe_cache.begin(src0->name, src0->data, nb02,
+                                                  ne00, ne01, (int) type, ne02, ids->ne[1]);
+            if (moe_cache_node) {
+                int32_t expert_ids[MOE_CACHE_MAX_TOPK];
                 for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
                     for (int id = 0; id < n_ids; ++id) {
-                        moe_cache_ids[iid1*n_ids + id] = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                        expert_ids[iid1*n_ids + id] = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
                     }
                 }
-                ggml_moe_cache.plan(moe_cache_dev, moe_cache_ids, (int)(n_ids * ids->ne[1]), moe_cache_slot_idx);
+                ggml_moe_cache.plan(moe_cache_node, expert_ids, (int)(n_ids * ids->ne[1]), moe_cache_slot_idx);
             }
         }
 
@@ -1661,10 +1663,12 @@ static void ggml_compute_forward_mul_mat_id(
 
                 assert(i02 < n_as);
 
-                if (moe_cache_dev >= 0 && moe_cache_slot_idx[iid1*n_ids + id] >= 0) {
-                    // GPU computes this row from the expert cache
+                if (moe_cache_node && moe_cache_slot_idx[iid1*n_ids + id] >= 0) {
                     const int64_t i11 = id % ne11;
                     moe_cache_compact[moe_cache_n_hits] = moe_cache_slot_idx[iid1*n_ids + id];
+                    moe_cache_experts[moe_cache_n_hits] = i02;
+                    moe_cache_ids[moe_cache_n_hits]     = id;
+                    moe_cache_tokens[moe_cache_n_hits]  = iid1;
                     moe_cache_acts[moe_cache_n_hits]    = (const float *) ((const char *) src1->data + i11*nb11 + iid1*nb12);
                     moe_cache_rows[moe_cache_n_hits]    = (float *) ((char *) dst->data + iid1*nb2 + id*nb1);
                     moe_cache_n_hits++;
@@ -1676,11 +1680,22 @@ static void ggml_compute_forward_mul_mat_id(
             }
         }
 
-        if (moe_cache_dev >= 0 && moe_cache_n_hits > 0) {
-            // one batched GPU launch for all cached rows; overlaps with the
-            // CPU miss-row compute below, collected before the node ends
-            ggml_moe_cache.dispatch(moe_cache_dev, (int) type, ne00, ne01,
-                                          moe_cache_n_hits, moe_cache_compact, moe_cache_acts);
+        if (moe_cache_node && moe_cache_n_hits > 0) {
+            if (!ggml_moe_cache.dispatch(moe_cache_node, (int) type, ne00, ne01,
+                                         moe_cache_n_hits, moe_cache_compact, moe_cache_acts)) {
+                for (int i = 0; i < moe_cache_n_hits; i++) {
+                    const int expert = moe_cache_experts[i];
+                    MMID_MATRIX_ROW(expert, matrix_row_counts[expert]) =
+                        (struct mmid_row_mapping) {moe_cache_ids[i], moe_cache_tokens[i]};
+                    matrix_row_counts[expert] += 1;
+                }
+                moe_cache_n_hits = 0;
+                ggml_moe_cache.end(moe_cache_node);
+                moe_cache_node = NULL;
+            }
+        } else if (moe_cache_node) {
+            ggml_moe_cache.end(moe_cache_node);
+            moe_cache_node = NULL;
         }
     }
 
@@ -1753,16 +1768,23 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
-    // MoE expert cache: thread 0 collects the GPU-computed rows into dst. The
-    // graph executor's post-node barrier guarantees every thread (including
-    // this one) is done before the next node reads dst.
-    if (moe_cache_dev >= 0 && moe_cache_n_hits > 0) {
-        ggml_moe_cache.collect(moe_cache_dev, moe_cache_n_hits, moe_cache_rows, ne0);
-    }
-    // bail-out judge: node wall-time samples for both phases (-3 = pure-CPU
-    // baseline window, >= 0 = cache-engaged)
-    if (ith == 0 && ggml_moe_cache.node_time && (moe_cache_dev >= 0 || moe_cache_dev == -3)) {
-        ggml_moe_cache.node_time(moe_cache_dev, ggml_time_us() - moe_cache_t0);
+    if (ith == 0 && moe_cache_node) {
+        if (!ggml_moe_cache.collect(moe_cache_node, moe_cache_n_hits, moe_cache_rows, ne0)) {
+            const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+            const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+            for (int i = 0; i < moe_cache_n_hits; i++) {
+                const int expert = moe_cache_experts[i];
+                const int64_t row = matrix_row_counts[expert];
+                MMID_MATRIX_ROW(expert, row) =
+                    (struct mmid_row_mapping) {moe_cache_ids[i], moe_cache_tokens[i]};
+                ggml_compute_forward_mul_mat_id_one_chunk(
+                    dst, src0, src1, ids, expert,
+                    0, ne01, row, row + 1,
+                    (const char *) src0->data + expert * nb02,
+                    matrix_rows, row_size, src1_cont, wdata);
+            }
+        }
+        ggml_moe_cache.end(moe_cache_node);
     }
 }
 

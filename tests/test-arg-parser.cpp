@@ -2,6 +2,7 @@
 #include "common.h"
 #include "download.h"
 
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include <sstream>
@@ -140,6 +141,64 @@ int main(void) {
     assert(params.lora_adapters[1].path == "file2,2.gguf");
     assert(params.lora_adapters[2].path == "file3\"3\".gguf");
     assert(params.lora_adapters[3].path == "file4\".gguf");
+
+    printf("test-arg-parser: test MoE cache and repack modes\n\n");
+
+    auto env_equals = [](const char * name, const char * value) {
+        const char * actual = getenv(name);
+        return actual != nullptr && std::string(actual) == value;
+    };
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf", "--moe-cache", "auto"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache_force == false);
+        assert(mode_params.no_extra_bufts == false);
+        assert(env_equals("GGML_CUDA_MOE_CACHE", "1"));
+        assert(env_equals("GGML_CUDA_MOE_CACHE_MODE", "auto"));
+        assert(getenv("GGML_CUDA_MOE_CACHE_BUDGET_MB") == nullptr);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf", "--moe-cache", "on", "--repack"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache_force == true);
+        assert(mode_params.no_extra_bufts == true);
+        assert(env_equals("GGML_CUDA_MOE_CACHE_MODE", "on"));
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf", "--repack", "--moe-cache", "256"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache_force == true);
+        assert(mode_params.no_extra_bufts == true);
+        assert(env_equals("GGML_CUDA_MOE_CACHE_BUDGET_MB", "256"));
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf", "--moe-cache", "off", "--repack"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache_force == false);
+        assert(mode_params.no_extra_bufts == false);
+        assert(env_equals("GGML_CUDA_MOE_CACHE", "0"));
+        assert(env_equals("GGML_CUDA_MOE_CACHE_MODE", "off"));
+        assert(getenv("GGML_CUDA_MOE_CACHE_BUDGET_MB") == nullptr);
+    }
+
+    {
+        common_params mode_params;
+        argv = {"binary_name", "-m", "model.gguf", "--moe-cache", "0"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        assert(mode_params.moe_cache_force == false);
+        assert(mode_params.no_extra_bufts == false);
+        assert(env_equals("GGML_CUDA_MOE_CACHE", "0"));
+        assert(env_equals("GGML_CUDA_MOE_CACHE_MODE", "off"));
+        assert(getenv("GGML_CUDA_MOE_CACHE_BUDGET_MB") == nullptr);
+    }
 
 // skip this part on windows, because setenv is not supported
 #ifdef _WIN32

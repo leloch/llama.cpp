@@ -14,9 +14,14 @@
 #include "ggml-impl.h"
 #include "ggml-backend-moe-cache.h"
 
-// MoE expert cache function table; populated by the CUDA backend at registry
-// init when GGML_CUDA_MOE_CACHE=1, consumed by the CPU mul_mat_id kernel.
+// Optional MoE expert cache function table, populated by a supporting backend.
 struct ggml_moe_cache_api ggml_moe_cache = {};
+
+void ggml_moe_cache_unregister(const void * owner) {
+    if (ggml_moe_cache.owner == owner) {
+        ggml_moe_cache = {};
+    }
+}
 
 #include <assert.h>
 #include <limits.h>
@@ -87,6 +92,16 @@ ggml_backend_dev_t ggml_backend_buft_get_device(ggml_backend_buffer_type_t buft)
     return buft->device;
 }
 
+static void ggml_backend_moe_cache_invalidate_buffer(
+        ggml_backend_buffer_t buffer, const void * address, size_t size) {
+    if (!ggml_moe_cache.invalidate || !buffer || !address || size == 0 ||
+        buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+        !ggml_backend_buffer_is_host(buffer)) {
+        return;
+    }
+    ggml_moe_cache.invalidate(address, size);
+}
+
 // backend buffer
 
 ggml_backend_buffer_t ggml_backend_buffer_init(
@@ -114,12 +129,12 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
         return;
     }
 
-    // MoE expert cache: host weight buffers can back queued cache-fill jobs;
-    // notify before the memory goes away (no-op when the cache is inactive)
-    if (ggml_moe_cache.invalidate && buffer->iface.get_base && ggml_backend_buffer_is_host(buffer)) {
+    // Host weight buffers can back queued cache-fill jobs.
+    if (buffer->iface.get_base) {
         void * base = ggml_backend_buffer_get_base(buffer);
         if (base) {
-            ggml_moe_cache.invalidate(base, ggml_backend_buffer_get_size(buffer));
+            ggml_backend_moe_cache_invalidate_buffer(
+                    buffer, base, ggml_backend_buffer_get_size(buffer));
         }
     }
 
@@ -170,6 +185,10 @@ void ggml_backend_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
         return;
     }
 
+    if (buffer->iface.get_base) {
+        ggml_backend_moe_cache_invalidate_buffer(
+                buffer, ggml_backend_buffer_get_base(buffer), buffer->size);
+    }
     buffer->iface.clear(buffer, value);
 }
 
@@ -191,6 +210,10 @@ bool ggml_backend_buffer_is_host(ggml_backend_buffer_t buffer) {
 
 void ggml_backend_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
     GGML_ASSERT(buffer);
+    if (usage != buffer->usage && buffer->iface.get_base) {
+        ggml_backend_moe_cache_invalidate_buffer(
+                buffer, ggml_backend_buffer_get_base(buffer), buffer->size);
+    }
     buffer->usage = usage;
 
     // FIXME: add a generic callback to the buffer interface
@@ -212,6 +235,10 @@ ggml_backend_buffer_type_t ggml_backend_buffer_get_type(ggml_backend_buffer_t bu
 void ggml_backend_buffer_reset(ggml_backend_buffer_t buffer) {
     GGML_ASSERT(buffer);
     if (buffer->iface.reset) {
+        if (buffer->iface.get_base) {
+            ggml_backend_moe_cache_invalidate_buffer(
+                    buffer, ggml_backend_buffer_get_base(buffer), buffer->size);
+        }
         buffer->iface.reset(buffer);
     }
 }
@@ -219,6 +246,8 @@ void ggml_backend_buffer_reset(ggml_backend_buffer_t buffer) {
 bool ggml_backend_buffer_copy_tensor(const struct ggml_tensor * src, struct ggml_tensor * dst) {
     ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
     if (dst_buf->iface.cpy_tensor) {
+        ggml_backend_moe_cache_invalidate_buffer(
+                dst_buf, dst->data, ggml_nbytes(dst));
         return dst_buf->iface.cpy_tensor(dst_buf, src, dst);
     }
     return false;
@@ -275,6 +304,9 @@ void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * 
         ggml_backend_synchronize(backend);
         ggml_backend_tensor_set(tensor, data, offset, size);
     } else {
+        ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+        ggml_backend_moe_cache_invalidate_buffer(
+                buf, (const char *) tensor->data + offset, size);
         backend->iface.set_tensor_async(backend, tensor, data, offset, size);
     }
 }
@@ -311,6 +343,10 @@ void ggml_backend_tensor_set_2d_async(ggml_backend_t backend, struct ggml_tensor
 
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    ggml_backend_moe_cache_invalidate_buffer(
+            buf, (const char *) tensor->data + offset,
+            (n_copies - 1)*stride_tensor + size);
     backend->iface.set_tensor_2d_async(backend, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
 
@@ -347,6 +383,8 @@ void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, siz
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
 
+    ggml_backend_moe_cache_invalidate_buffer(
+            buf, (const char *) tensor->data + offset, size);
     buf->iface.set_tensor(buf, tensor, data, offset, size);
 }
 
@@ -384,6 +422,9 @@ void ggml_backend_tensor_set_2d(struct ggml_tensor * tensor, const void * data, 
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
 
+    ggml_backend_moe_cache_invalidate_buffer(
+            buf, (const char *) tensor->data + offset,
+            (n_copies - 1)*stride_tensor + size);
     buf->iface.set_tensor_2d(buf, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
 
@@ -422,6 +463,8 @@ void ggml_backend_tensor_memset(struct ggml_tensor * tensor, uint8_t value, size
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
     GGML_ASSERT(buf->iface.memset_tensor != NULL && "memset not implemented by backend buffer");
 
+    ggml_backend_moe_cache_invalidate_buffer(
+            buf, (const char *) tensor->data + offset, size);
     buf->iface.memset_tensor(buf, tensor, value, offset, size);
 }
 
@@ -495,9 +538,13 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
         return;
     }
 
-    if (ggml_backend_buffer_is_host(src->buffer)) {
+    ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (ggml_backend_buffer_is_host(src_buf)) {
         ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
-    } else if (ggml_backend_buffer_is_host(dst->buffer)) {
+    } else if (ggml_backend_buffer_is_host(dst_buf)) {
+        ggml_backend_moe_cache_invalidate_buffer(
+                dst_buf, dst->data, ggml_nbytes(dst));
         ggml_backend_tensor_get(src, dst->data, 0, ggml_nbytes(src));
     } else if (!ggml_backend_buffer_copy_tensor(src, dst)) {
 #ifndef NDEBUG
@@ -520,6 +567,9 @@ void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t b
 
     GGML_ASSERT(backend_dst);
     if (backend_dst->iface.cpy_tensor_async != NULL) {
+        ggml_backend_buffer_t dst_buf = dst->view_src ? dst->view_src->buffer : dst->buffer;
+        ggml_backend_moe_cache_invalidate_buffer(
+                dst_buf, dst->data, ggml_nbytes(dst));
         if (backend_dst->iface.cpy_tensor_async(backend_src, backend_dst, src, dst)) {
             return;
         }
@@ -823,6 +873,7 @@ struct ggml_backend_sched {
     int n_graph_inputs;
 
     struct ggml_context * ctx;
+    void * moe_cache_session;
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
@@ -1556,6 +1607,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    struct moe_cache_scope {
+        void * session;
+        void (*leave)(void *);
+
+        explicit moe_cache_scope(void * session)
+            : session(session), leave(ggml_moe_cache.session_leave) {
+            auto enter = ggml_moe_cache.session_enter;
+            if (enter && leave) {
+                enter(session);
+            } else {
+                leave = nullptr;
+            }
+        }
+
+        ~moe_cache_scope() {
+            if (leave) {
+                leave(session);
+            }
+        }
+    } cache_scope(sched->moe_cache_session);
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
@@ -1673,15 +1745,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                     copy_experts(first_id, last_id);
                 } else {
-                    // MoE expert cache dst handoff: if the cache populated this
-                    // input's GPU copy directly (down-projection rows), skip the
-                    // round-trip copy AND the blocking sync — the cache installed
-                    // a stream-order dependency on this backend instead.
-                    if (ggml_moe_cache.redirect_finalize &&
-                        ggml_moe_cache.redirect_finalize(input->data, split_backend)) {
-                        continue;
-                    }
-
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
@@ -1692,42 +1755,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             ggml_backend_synchronize(split_backend);
                         }
                         ggml_backend_tensor_copy(input, input_cpy);
-                    }
-                }
-            }
-        }
-
-        // MoE expert cache dst handoff: before running a CPU split that ends in a
-        // MUL_MAT_ID, offer the cache the GPU-side copy tensor of that dst so it
-        // can scatter its GPU-computed rows directly (skipping the host round
-        // trip). Engaged only with a single, unique CUDA consumer and one copy.
-        // note: the CPU backend is always the last one (asserted in sched_new);
-        // do NOT use ggml_backend_dev_type here — the CUDA implementation calls
-        // cudaGetDeviceProperties (~ms per call!) and this runs per split.
-        if (ggml_moe_cache.redirect_offer && sched->n_copies == 1 &&
-            split->graph.n_nodes > 0 &&
-            split_backend_id == sched->n_backends - 1) {
-            ggml_tensor * last = split->graph.nodes[split->graph.n_nodes - 1];
-            if (last->op == GGML_OP_MUL_MAT_ID && !(last->flags & GGML_TENSOR_FLAG_OUTPUT)) {
-                int consumer_split = -1;
-                int n_consumers = 0;
-                for (int j = split_id + 1; j < sched->n_splits && n_consumers < 2; j++) {
-                    for (int k = 0; k < splits[j].n_inputs; k++) {
-                        if (splits[j].inputs[k] == last) {
-                            n_consumers++;
-                            consumer_split = j;
-                            break;
-                        }
-                    }
-                }
-                if (n_consumers == 1) {
-                    ggml_backend_t cons_backend = sched->backends[splits[consumer_split].backend_id];
-                    ggml_tensor * cpy = tensor_copy(last, splits[consumer_split].backend_id, sched->cur_copy);
-                    if (cpy && cpy->data && splits[consumer_split].backend_id != sched->n_backends - 1 &&
-                        ggml_is_contiguous(last)) {
-                        ggml_moe_cache.redirect_offer(last->data, last->nb[1],
-                                                            last->ne[1] * last->ne[2],
-                                                            cpy->data, cons_backend);
                     }
                 }
             }
@@ -1844,6 +1871,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
 
+    if (ggml_moe_cache.session_create) {
+        void * cache_backends[GGML_SCHED_MAX_BACKENDS];
+        for (int b = 0; b < n_backends; b++) {
+            cache_backends[b] = backends[b];
+        }
+        sched->moe_cache_session = ggml_moe_cache.session_create(cache_backends, n_backends);
+    }
+
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
 
@@ -1855,6 +1890,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    if (sched->moe_cache_session && ggml_moe_cache.session_destroy) {
+        ggml_moe_cache.session_destroy(sched->moe_cache_session);
+        sched->moe_cache_session = NULL;
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
